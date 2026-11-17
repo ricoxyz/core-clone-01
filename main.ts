@@ -78,7 +78,19 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  process.stdout.write('[entry] initializing GitHub-compatible git forge engine\n');
   const server = createApp();
+
+  const shutdown = () => {
+    try {
+      server.close();
+    } catch {
+      // ignore
+    }
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());
@@ -91,8 +103,8 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
+  shutdown();
+  process.stdout.write('[entry] completed successfully\n');
 }
 
 try {

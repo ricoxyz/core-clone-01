@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.tar.gz
+*.jsonl
+.env
+out/
+.DS_Store
+Thumbs.db

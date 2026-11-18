@@ -25,13 +25,13 @@ var (
 
 	connReadBufPool = sync.Pool{
 		New: func() any {
-			b := make([]byte, 65536)
+			b := make([]byte, 4096)
 			return &b
 		},
 	}
 	connWriteBufPool = sync.Pool{
 		New: func() any {
-			b := make([]byte, 0, 8192)
+			b := make([]byte, 0, 2048)
 			return &b
 		},
 	}
@@ -42,8 +42,8 @@ func prewarmPools() {
 	rb := make([]*[]byte, n)
 	wb := make([]*[]byte, n)
 	for i := 0; i < n; i++ {
-		r := make([]byte, 65536)
-		w := make([]byte, 0, 8192)
+		r := make([]byte, 4096)
+		w := make([]byte, 0, 2048)
 		rb[i] = &r
 		wb[i] = &w
 	}
@@ -56,7 +56,6 @@ func prewarmPools() {
 type Server struct {
 	store    *ForgeStore
 	listener net.Listener
-	wg       sync.WaitGroup
 }
 
 func NewServer(store *ForgeStore) *Server {
@@ -80,9 +79,7 @@ func (s *Server) Serve() {
 		}
 		// Go's net.TCPListener already enables TCP_NODELAY=1 by default; enable TCP_QUICKACK on Linux
 		setQuickAck(conn)
-		s.wg.Add(1)
 		go func(c net.Conn) {
-			defer s.wg.Done()
 			defer c.Close()
 			s.serveConn(c)
 		}(conn)
@@ -1173,6 +1170,7 @@ func (s *Server) handleRest(method, subpath, query, host string, rawBody []byte,
 			if qSha == "" {
 				qSha = repo.DefaultBranch
 			}
+			repo.EnsureMaterialized()
 			repo.mu.RLock()
 			tip := repo.Refs["refs/heads/"+qSha]
 			if tip == "" {

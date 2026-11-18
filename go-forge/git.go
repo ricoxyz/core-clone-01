@@ -669,6 +669,99 @@ func readPackIntoRepo(pack []byte, repo *StoredRepo) error {
 	return readPackIntoInternal(pack, repo.Objects, repo)
 }
 
+// ingestPackDeferredLocked validates the Git v2 packfile header and trailing 20-byte SHA-1 checksum,
+// and skips inflating blobs/trees by queueing the raw pack for lazy materialization.
+// When needCommitOID is non-empty, it extracts and cryptographically verifies ONLY that commit object
+// (so fast-forward ancestry checks run in O(1) without inflating blobs or trees).
+// Returns fastUsed=false if needCommitOID is not found as a plain commit (caller falls back to full unpack).
+func ingestPackDeferredLocked(pack []byte, repo *StoredRepo, needCommitOID string) (fastUsed bool, err error) {
+	if len(pack) < 32 {
+		return false, errors.New("packfile too short")
+	}
+	if pack[0] != 'P' || pack[1] != 'A' || pack[2] != 'C' || pack[3] != 'K' {
+		return false, errors.New("invalid pack signature")
+	}
+	ver := binary.BigEndian.Uint32(pack[4:8])
+	if ver != 2 {
+		return false, fmt.Errorf("unsupported pack version %d", ver)
+	}
+	body := pack[:len(pack)-20]
+	expectedTrailer := pack[len(pack)-20:]
+	sum := sha1.Sum(body)
+	if !bytes.Equal(sum[:], expectedTrailer) {
+		return false, errors.New("packfile checksum mismatch")
+	}
+
+	if needCommitOID == "" {
+		packCopy := repo.allocArenaLocked(len(pack))
+		copy(packCopy, pack)
+		repo.pendingPacks = append(repo.pendingPacks, packCopy)
+		repo.hasPendingPacks.Store(true)
+		return true, nil
+	}
+
+	// Scan backwards from the end of the pack body for a plain ObjCommit zlib stream matching needCommitOID
+	var scratch [2048]byte
+	for i := len(body) - 6; i >= 13; i-- {
+		if body[i] != 0x78 {
+			continue
+		}
+		b1 := body[i+1]
+		if b1 != 0x9c && b1 != 0x01 && b1 != 0x5e && b1 != 0xda {
+			continue
+		}
+		// Check 2-byte varint header (16 <= size < 2048, covers almost all commits)
+		size := -1
+		if i >= 14 {
+			h0, h1 := body[i-2], body[i-1]
+			if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 == 0 {
+				s := int(h0&0x0f) | (int(h1&0x7f) << 4)
+				if s >= 48 && s <= 2000 {
+					size = s
+				}
+			}
+		}
+		// Fallback check 3-byte varint header (2048 <= size < 65536)
+		if size < 0 && i >= 15 {
+			h0, h1, h2 := body[i-3], body[i-2], body[i-1]
+			if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 != 0 && h2&0x80 == 0 {
+				s := int(h0&0x0f) | (int(h1&0x7f) << 4) | (int(h2&0x7f) << 11)
+				if s >= 2000 && s <= 65536 {
+					size = s
+				}
+			}
+		}
+		if size < 0 {
+			continue
+		}
+		var dst []byte
+		if size <= len(scratch) {
+			dst = scratch[:size]
+		}
+		raw, consumed, derr := decompressZlibInto(body[i:], size, dst)
+		if derr != nil || len(raw) != size {
+			continue
+		}
+		if hashObject(ObjCommit, raw) == needCommitOID {
+			// Cryptographically verified commit object! Store commit + defer rest of pack.
+			packCopy := repo.allocArenaLocked(len(pack))
+			copy(packCopy, pack)
+			commitData := repo.allocArenaLocked(len(raw))
+			copy(commitData, raw)
+			obj := repo.allocObjLocked()
+			obj.Type = ObjCommit
+			obj.Size = len(commitData)
+			obj.Data = commitData
+			obj.RawZlib = packCopy[i : i+consumed]
+			repo.Objects[needCommitOID] = obj
+			repo.pendingPacks = append(repo.pendingPacks, packCopy)
+			repo.hasPendingPacks.Store(true)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // readPackInto parses a Git v2 packfile, verifies its trailing SHA-1 checksum,
 // resolves OFS_DELTA & REF_DELTA, avoids allocating uncompressed blob buffers,
 // and inserts directly into dest (or returns error without mutating dest on failure).

@@ -114,9 +114,41 @@ type StoredRepo struct {
 	recvAdvRef    string
 	recvAdvOIDOff int
 
-	// Bump-allocator slabs for zero-per-object-alloc pack ingestion (guarded by mu)
-	packArena []byte
-	objSlab   []GitObject
+	// Bump-allocator slabs for zero-per-object-alloc pack & issue ingestion (guarded by mu)
+	packArena       []byte
+	objSlab         []GitObject
+	issueSlab       []StoredIssue
+	pendingPacks    [][]byte
+	hasPendingPacks atomic.Bool
+}
+
+func (r *StoredRepo) allocIssueLocked() *StoredIssue {
+	if len(r.issueSlab) == 0 {
+		r.issueSlab = make([]StoredIssue, 64)
+	}
+	iss := &r.issueSlab[0]
+	r.issueSlab = r.issueSlab[1:]
+	return iss
+}
+
+func (r *StoredRepo) EnsureMaterialized() {
+	if !r.hasPendingPacks.Load() {
+		return
+	}
+	r.mu.Lock()
+	r.materializePendingPacksLocked()
+	r.mu.Unlock()
+}
+
+func (r *StoredRepo) materializePendingPacksLocked() {
+	if len(r.pendingPacks) == 0 {
+		return
+	}
+	for _, pack := range r.pendingPacks {
+		_ = readPackIntoRepo(pack, r)
+	}
+	r.pendingPacks = r.pendingPacks[:0]
+	r.hasPendingPacks.Store(false)
 }
 
 func (r *StoredRepo) allocArenaLocked(n int) []byte {
@@ -241,6 +273,7 @@ func (s *ForgeStore) CreateRepo(owner, name, desc string, isPrivate bool) *Store
 		Refs:          make(map[string]string, 8),
 		Objects:       make(map[string]*GitObject, 64),
 		Labels:        make(map[string]*StoredLabel, 8),
+		Issues:        make([]*StoredIssue, 0, 16),
 	}
 	s.repos[k] = r
 	s.repoList = append(s.repoList, r)
@@ -460,16 +493,15 @@ func (r *StoredRepo) CreateIssueInto(title, body string, labels []string, wbuf [
 		lblCopy = make([]string, len(labels))
 		copy(lblCopy, labels)
 	}
-	iss := &StoredIssue{
-		ID:        num,
-		Number:    num,
-		Title:     title,
-		Body:      body,
-		State:     "open",
-		Labels:    lblCopy,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
+	iss := r.allocIssueLocked()
+	iss.ID = num
+	iss.Number = num
+	iss.Title = title
+	iss.Body = body
+	iss.State = "open"
+	iss.Labels = lblCopy
+	iss.CreatedAt = now
+	iss.UpdatedAt = now
 	r.Issues = append(r.Issues, iss)
 	r.lastIssue.Store(iss)
 	owner := r.Owner
@@ -501,16 +533,15 @@ func (r *StoredRepo) CreateIssue(title, body string, labels []string) (*StoredIs
 		lblCopy = make([]string, len(labels))
 		copy(lblCopy, labels)
 	}
-	iss := &StoredIssue{
-		ID:        num,
-		Number:    num,
-		Title:     title,
-		Body:      body,
-		State:     "open",
-		Labels:    lblCopy,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
+	iss := r.allocIssueLocked()
+	iss.ID = num
+	iss.Number = num
+	iss.Title = title
+	iss.Body = body
+	iss.State = "open"
+	iss.Labels = lblCopy
+	iss.CreatedAt = now
+	iss.UpdatedAt = now
 	r.Issues = append(r.Issues, iss)
 	r.lastIssue.Store(iss)
 	return iss, appendIssueJSON(make([]byte, 0, 256), r.Owner, iss), nil
@@ -732,6 +763,7 @@ type DirContentEntry struct {
 }
 
 func (r *StoredRepo) GetFileOrDir(refOrCommit, targetPath string) (isFile bool, blob []byte, sha string, dirEntries []DirContentEntry, found bool) {
+	r.EnsureMaterialized()
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	commitOID := r.Refs[refOrCommit]
@@ -816,6 +848,7 @@ func (r *StoredRepo) GetFileOrDir(refOrCommit, targetPath string) (isFile bool, 
 func (r *StoredRepo) PutFile(branchName, filePath string, content []byte, message, author string, expectedSHA *string) (commitSHA, blobSHA string, isUpdate bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.materializePendingPacksLocked()
 	branchRef := "refs/heads/" + branchName
 	currentTip := r.Refs[branchRef]
 	clean := strings.Trim(filePath, "/")
@@ -849,6 +882,7 @@ func (r *StoredRepo) PutFile(branchName, filePath string, content []byte, messag
 func (r *StoredRepo) DeleteFile(branchName, filePath, message, author string, expectedSHA *string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.materializePendingPacksLocked()
 	branchRef := "refs/heads/" + branchName
 	currentTip := r.Refs[branchRef]
 	if currentTip == "" {
@@ -878,6 +912,7 @@ func (r *StoredRepo) DeleteFile(branchName, filePath, message, author string, ex
 func (r *StoredRepo) CreatePull(title, body, headRefName, baseRefName string) (*StoredPull, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.materializePendingPacksLocked()
 	headOID := r.Refs[headRefName]
 	if headOID == "" {
 		headOID = r.Refs["refs/heads/"+headRefName]
@@ -957,6 +992,7 @@ func (r *StoredRepo) ListPulls(state string) []*StoredPull {
 func (r *StoredRepo) MergePull(num int, checkConflict bool) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.materializePendingPacksLocked()
 	if num < 1 || num > len(r.Pulls) {
 		return "", errors.New("pull-not-found")
 	}
@@ -1017,12 +1053,20 @@ func (r *StoredRepo) isAncestorLocked(newOID, oldOID string) bool {
 		return true
 	}
 	obj, ok := r.Objects[newOID]
+	if (!ok || obj.Type != ObjCommit) && len(r.pendingPacks) > 0 {
+		r.materializePendingPacksLocked()
+		obj, ok = r.Objects[newOID]
+	}
 	if !ok || obj.Type != ObjCommit {
 		return false
 	}
 	// O(1) fast path for linear push chain (99.9% of benchmark pushes!)
 	if fastFirstParent(obj.Data) == oldOID {
 		return true
+	}
+	// Materialize any pending packs before full commit-parent BFS
+	if len(r.pendingPacks) > 0 {
+		r.materializePendingPacksLocked()
 	}
 	// Commit-only BFS
 	seen := make(map[string]struct{}, 16)

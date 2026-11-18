@@ -298,6 +298,7 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 			return false
 		}
 
+		repo.EnsureMaterialized()
 		repo.mu.RLock()
 		refs := sortedRefsLocked(repo)
 		var body []byte
@@ -385,6 +386,7 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 			}
 		}
 
+		repo.EnsureMaterialized()
 		repo.mu.RLock()
 
 		// Collect complete reachability from haves (commits, trees, blobs), stopping at client shallow boundaries
@@ -684,9 +686,20 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					unpackOk := true
 					unpackErr := ""
 					if len(packData) > 0 {
-						if perr := readPackIntoRepo(packData, repo); perr != nil {
+						var needCommit string
+						if oldOID != ZeroOID && newOID != ZeroOID {
+							needCommit = newOID
+						}
+						fastUsed, perr := ingestPackDeferredLocked(packData, repo, needCommit)
+						if perr != nil {
 							unpackOk = false
 							unpackErr = perr.Error()
+						} else if !fastUsed {
+							repo.materializePendingPacksLocked()
+							if rerr := readPackIntoRepo(packData, repo); rerr != nil {
+								unpackOk = false
+								unpackErr = rerr.Error()
+							}
 						}
 					}
 
@@ -817,6 +830,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 	unpackErr := ""
 
 	if len(packData) > 0 {
+		repo.materializePendingPacksLocked()
 		if perr := readPackIntoRepo(packData, repo); perr != nil {
 			unpackOk = false
 			unpackErr = perr.Error()

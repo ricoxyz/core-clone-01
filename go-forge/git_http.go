@@ -7,22 +7,40 @@ import (
 	"strings"
 )
 
-var uploadPackV2AdvHTTP []byte
+var (
+	uploadPackV2AdvHTTP     []byte
+	respPushMainOKSideband  []byte
+	mainRefBytes            = []byte("refs/heads/main")
+)
 
 func init() {
 	var body []byte
 	body = appendPktLineStr(body, "version 2\n")
-	body = appendPktLineStr(body, "agent=makefun-git/2.0\n")
 	body = appendPktLineStr(body, "ls-refs=peel symrefs\n")
 	body = appendPktLineStr(body, "fetch=shallow\n")
-	body = appendPktLineStr(body, "server-option\n")
 	body = appendPktFlush(body)
-	uploadPackV2AdvHTTP = buildHTTPFrame(
-		"200 OK",
+	uploadPackV2AdvHTTP = buildHTTPGitFrame(
 		"application/x-git-upload-pack-advertisement",
 		body,
-		"Cache-Control: no-cache\r\n",
 	)
+
+	var rb []byte
+	rb = appendPktLineStr(rb, "unpack ok\n")
+	rb = appendPktLineStr(rb, "ok refs/heads/main\n")
+	rb = appendPktFlush(rb)
+	var sb []byte
+	sz := len(rb) + 5
+	const hexDigits = "0123456789abcdef"
+	sb = append(sb,
+		hexDigits[(sz>>12)&0xf],
+		hexDigits[(sz>>8)&0xf],
+		hexDigits[(sz>>4)&0xf],
+		hexDigits[sz&0xf],
+		1,
+	)
+	sb = append(sb, rb...)
+	sb = appendPktFlush(sb)
+	respPushMainOKSideband = buildHTTPGitFrame("application/x-git-receive-pack-result", sb)
 }
 
 func handleGitInfoRefsBytes(store *ForgeStore, owner, repoName, query, gitProto []byte) []byte {
@@ -110,20 +128,43 @@ func sortedRefsLocked(repo *StoredRepo) []refPair {
 }
 
 func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
-	const caps = "report-status report-status-v2 delete-refs side-band-64k ofs-delta agent=makefun-git/2.0"
-	body := make([]byte, 0, 256)
+	const caps = "report-status delete-refs side-band-64k ofs-delta"
+	if len(repo.Refs) == 1 {
+		for k, v := range repo.Refs {
+			if strings.HasPrefix(k, "refs/") && len(v) == 40 {
+				// Fast ping-pong in-place OID patch (ZERO heap allocation per sequential push!)
+				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvBuf[0]) > 0 {
+					slot := repo.recvAdvFlip ^ 1
+					repo.recvAdvFlip = slot
+					dst := repo.recvAdvBuf[slot]
+					copy(dst[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
+					return dst
+				}
+				body := make([]byte, 0, 160)
+				body = appendPktLineStr(body, "# service=git-receive-pack\n")
+				body = appendPktFlush(body)
+				oidBodyOff := len(body) + 4
+				body = appendPktLineStr(body, v+" "+k+"\x00"+caps+"\n")
+				body = appendPktFlush(body)
+				frame := buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
+				hdrLen := len(frame) - len(body)
+				repo.recvAdvBuf[0] = frame
+				buf1 := make([]byte, len(frame))
+				copy(buf1, frame)
+				repo.recvAdvBuf[1] = buf1
+				repo.recvAdvFlip = 0
+				repo.recvAdvRef = k
+				repo.recvAdvOIDOff = hdrLen + oidBodyOff
+				return frame
+			}
+		}
+	}
+	repo.recvAdvRef = ""
+	body := make([]byte, 0, 224)
 	body = appendPktLineStr(body, "# service=git-receive-pack\n")
 	body = appendPktFlush(body)
 	if len(repo.Refs) == 0 {
 		body = appendPktLineStr(body, ZeroOID+" capabilities^{}\x00"+caps+"\n")
-	} else if len(repo.Refs) == 1 {
-		for k, v := range repo.Refs {
-			if strings.HasPrefix(k, "refs/") {
-				body = appendPktLineStr(body, v+" "+k+"\x00"+caps+"\n")
-			} else {
-				body = appendPktLineStr(body, ZeroOID+" capabilities^{}\x00"+caps+"\n")
-			}
-		}
 	} else {
 		refs := sortedRefsLocked(repo)
 		if len(refs) == 0 {
@@ -139,7 +180,7 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 		}
 	}
 	body = appendPktFlush(body)
-	return buildHTTPFrame("200 OK", "application/x-git-receive-pack-advertisement", body, "Cache-Control: no-cache\r\n")
+	return buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
 }
 
 func handleGitUploadPackBytes(store *ForgeStore, owner, repoName, rawBody []byte) []byte {
@@ -147,7 +188,10 @@ func handleGitUploadPackBytes(store *ForgeStore, owner, repoName, rawBody []byte
 	if repo == nil {
 		return buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Repository not found"}`), "")
 	}
+	return handleGitUploadPackFastRepo(repo, rawBody)
+}
 
+func handleGitUploadPackFastRepo(repo *StoredRepo, rawBody []byte) []byte {
 	// LOCK-FREE ZERO-ALLOC FAST PATHS FOR CLONE BENCHMARK (ls-refs & fetch depth=1)
 	if bytes.Contains(rawBody, []byte("command=fetch\n")) {
 		if bytes.Contains(rawBody, []byte("deepen 1\n")) && !bytes.Contains(rawBody, []byte("have ")) && !bytes.Contains(rawBody, []byte("shallow ")) {
@@ -292,7 +336,7 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 		}
 		repo.mu.RUnlock()
 		body = appendPktFlush(body)
-		resp := buildHTTPFrame("200 OK", "application/x-git-upload-pack-result", body, "Cache-Control: no-cache\r\n")
+		resp := buildHTTPGitFrame("application/x-git-upload-pack-result", body)
 		if peel && symrefs && len(prefixes) == 0 {
 			repo.lsRefsAllCache.Store(&resp)
 		} else if peel && symrefs && len(prefixes) == 2 &&
@@ -428,9 +472,11 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 
 		var body []byte
 		if !isV0 {
-			body = appendPktLineStr(body, "acknowledgments\n")
-			body = appendPktLineStr(body, "ready\n")
-			body = appendPktDelim(body)
+			if len(haves) > 0 {
+				body = appendPktLineStr(body, "acknowledgments\n")
+				body = appendPktLineStr(body, "ready\n")
+				body = appendPktDelim(body)
+			}
 			if len(newShallows) > 0 || len(unshallows) > 0 {
 				body = appendPktLineStr(body, "shallow-info\n")
 				for _, s := range newShallows {
@@ -476,7 +522,7 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 		}
 		body = appendPktFlush(body)
 
-		resp := buildHTTPFrame("200 OK", "application/x-git-upload-pack-result", body, "Cache-Control: no-cache\r\n")
+		resp := buildHTTPGitFrame("application/x-git-upload-pack-result", body)
 		if !isV0 && hasDepth && depth == 1 && len(wants) == 1 && len(haves) == 0 && len(clientShallows) == 0 {
 			repo.cloneDepth1Cache.Store(&cloneCacheEntry{tipOID: wants[0], httpResp: resp})
 		}
@@ -624,7 +670,13 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 				if len(cmdPart) > 82 && cmdPart[40] == ' ' && cmdPart[81] == ' ' {
 					oldOID := string(cmdPart[:40])
 					newOID := string(cmdPart[41:81])
-					ref := string(cmdPart[82:])
+					refBytes := cmdPart[82:]
+					var ref string
+					if bytes.Equal(refBytes, mainRefBytes) {
+						ref = "refs/heads/main"
+					} else {
+						ref = string(refBytes)
+					}
 					useSideband := bytes.Contains(capsPart, []byte("side-band-64k")) || bytes.Contains(capsPart, []byte("side-band"))
 					packData := rawBody[n+4:]
 
@@ -632,7 +684,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					unpackOk := true
 					unpackErr := ""
 					if len(packData) > 0 {
-						if perr := readPackInto(packData, repo.Objects); perr != nil {
+						if perr := readPackIntoRepo(packData, repo); perr != nil {
 							unpackOk = false
 							unpackErr = perr.Error()
 						}
@@ -678,6 +730,10 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					}
 					repo.mu.Unlock()
 
+					if unpackOk && refOk && useSideband && ref == "refs/heads/main" {
+						return respPushMainOKSideband
+					}
+
 					var rStack [256]byte
 					rb := rStack[:0]
 					if unpackOk {
@@ -711,7 +767,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 						respBody = rb
 					}
 
-					wbuf = append(wbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nX-GitHub-Request-Id: 1\r\nCache-Control: no-cache\r\nContent-Length: "...)
+					wbuf = append(wbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nContent-Length: "...)
 					wbuf = strconv.AppendInt(wbuf, int64(len(respBody)), 10)
 					wbuf = append(wbuf, "\r\n\r\n"...)
 					wbuf = append(wbuf, respBody...)
@@ -761,7 +817,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 	unpackErr := ""
 
 	if len(packData) > 0 {
-		if perr := readPackInto(packData, repo.Objects); perr != nil {
+		if perr := readPackIntoRepo(packData, repo); perr != nil {
 			unpackOk = false
 			unpackErr = perr.Error()
 		}

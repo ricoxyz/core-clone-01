@@ -21,7 +21,6 @@ import { chmodSync, copyFileSync, existsSync, accessSync, constants as fsConstan
 import { dirname, join } from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { createApp } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -146,6 +145,7 @@ async function main(): Promise<void> {
     shutdown = native.stop;
     process.stdout.write(`[entry] static Go core listening on port ${port}\n`);
   } else {
+    const { createApp } = await import('./app.ts');
     const server = createApp();
     shutdown = () => {
       try {

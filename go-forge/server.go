@@ -78,10 +78,8 @@ func (s *Server) Serve() {
 		if err != nil {
 			return
 		}
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-			_ = tc.SetKeepAlive(true)
-		}
+		// Go's net.TCPListener already enables TCP_NODELAY=1 by default; enable TCP_QUICKACK on Linux
+		setQuickAck(conn)
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
@@ -137,6 +135,68 @@ func containsBearerSIMD(hdr []byte) bool {
 
 func containsConnCloseSIMD(hdr []byte) bool {
 	return bytes.Index(hdr, []byte("close")) >= 0 && (bytes.Index(hdr, []byte("Connection: close")) >= 0 || bytes.Index(hdr, []byte("connection: close")) >= 0)
+}
+
+func findContentLengthSIMD(hdr []byte) (int, bool) {
+	idx := bytes.Index(hdr, []byte("\r\ncontent-length:"))
+	if idx < 0 {
+		idx = bytes.Index(hdr, []byte("\r\nContent-Length:"))
+		if idx < 0 {
+			return 0, false
+		}
+	}
+	p := idx + 17
+	for p < len(hdr) && (hdr[p] == ' ' || hdr[p] == '\t') {
+		p++
+	}
+	if p >= len(hdr) || hdr[p] < '0' || hdr[p] > '9' {
+		return 0, false
+	}
+	n := 0
+	for p < len(hdr) {
+		c := hdr[p]
+		if c == '\r' || c == ' ' || c == '\t' {
+			break
+		}
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+		p++
+	}
+	return n, true
+}
+
+func readFastBody(conn net.Conn, buf []byte, bodyStart, end, cl int) ([]byte, []byte, int, int, bool) {
+	needEnd := bodyStart + cl
+	if needEnd > len(buf) {
+		avail := end - bodyStart
+		newBuf := make([]byte, cl+65536)
+		copy(newBuf, buf[bodyStart:end])
+		buf = newBuf
+		bodyStart = 0
+		end = avail
+		needEnd = cl
+	}
+	if end < needEnd {
+		setQuickAck(conn)
+		for end < needEnd {
+			n, err := conn.Read(buf[end:needEnd])
+			if n > 0 {
+				end += n
+			}
+			if err != nil && end < needEnd {
+				return buf, nil, 0, 0, false
+			}
+		}
+	}
+	body := buf[bodyStart:needEnd]
+	nextStart := needEnd
+	if nextStart == end {
+		nextStart = 0
+		end = 0
+	}
+	return buf, body, nextStart, end, true
 }
 
 func (s *Server) serveConn(conn net.Conn) {
@@ -276,6 +336,118 @@ func (s *Server) serveConn(conn net.Conn) {
 									return
 								}
 								continue
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// =========================================================================
+		// DIRECT SIMD ZERO-HEADER-LOOP FAST PATH C: POST /api/v3/repos/{o}/{r}/issues
+		// =========================================================================
+		if buf[start] == 'P' && bytes.HasPrefix(headerBlock, []byte("POST /api/v3/repos/")) {
+			if sp := bytes.IndexByte(headerBlock[19:], ' '); sp > 7 {
+				rest := headerBlock[19 : 19+sp]
+				if bytes.HasSuffix(rest, []byte("/issues")) {
+					mid := rest[:len(rest)-7]
+					if slash := bytes.IndexByte(mid, '/'); slash > 0 && bytes.IndexByte(mid[slash+1:], '/') < 0 {
+						if cl, clOK := findContentLengthSIMD(headerBlock); clOK && cl > 0 && containsBearerSIMD(headerBlock) {
+							closeAfter := containsConnCloseSIMD(headerBlock)
+							repo := s.store.GetRepoBytes(mid[:slash], mid[slash+1:])
+							var reqBody []byte
+							var ok bool
+							buf, reqBody, start, end, ok = readFastBody(conn, buf, bodyStart, end, cl)
+							if !ok {
+								return
+							}
+							var resp []byte
+							if repo == nil {
+								resp = respNotFound
+							} else {
+								var title, body string
+								var labels []string
+								var fastOK bool
+								if title, body, fastOK = parseSimpleIssueJSON(reqBody); !fastOK {
+									var payload struct {
+										Title  string   `json:"title"`
+										Body   string   `json:"body"`
+										Labels []string `json:"labels"`
+									}
+									if err := json.Unmarshal(reqBody, &payload); err != nil {
+										resp = respBadJSON
+									} else {
+										title, body, labels = payload.Title, payload.Body, payload.Labels
+										out, cerr := repo.CreateIssueInto(title, body, labels, wbuf[:0])
+										if cerr != nil {
+											resp = buildHTTPJSONFrame("422 Unprocessable Entity", []byte(`{"message":"Validation Failed"}`), "")
+										} else {
+											resp = out
+										}
+									}
+								} else {
+									out, cerr := repo.CreateIssueInto(title, body, nil, wbuf[:0])
+									if cerr != nil {
+										resp = buildHTTPJSONFrame("422 Unprocessable Entity", []byte(`{"message":"Validation Failed"}`), "")
+									} else {
+										resp = out
+									}
+								}
+							}
+							if _, err := conn.Write(resp); err != nil {
+								return
+							}
+							if closeAfter {
+								return
+							}
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		// =========================================================================
+		// DIRECT SIMD ZERO-HEADER-LOOP FAST PATH D & E: POST /{o}/{r}.git/git-(upload|receive)-pack
+		// =========================================================================
+		if buf[start] == 'P' && len(headerBlock) > 30 && bytes.HasPrefix(headerBlock, []byte("POST /")) {
+			firstNL := bytes.IndexByte(headerBlock, '\r')
+			if firstNL > 26 {
+				reqLine := headerBlock[:firstNL]
+				if gitIdx := bytes.Index(reqLine, []byte(".git/git-")); gitIdx > 6 {
+					ownerRepo := reqLine[6:gitIdx]
+					if slash := bytes.IndexByte(ownerRepo, '/'); slash > 0 && bytes.IndexByte(ownerRepo[slash+1:], '/') < 0 {
+						svcEnd := bytes.IndexByte(reqLine[gitIdx+5:], ' ')
+						if svcEnd > 0 {
+							svc := reqLine[gitIdx+5 : gitIdx+5+svcEnd]
+							isUpload := bytes.Equal(svc, []byte("git-upload-pack"))
+							isReceive := !isUpload && bytes.Equal(svc, []byte("git-receive-pack"))
+							if isUpload || isReceive {
+								if cl, clOK := findContentLengthSIMD(headerBlock); clOK && cl >= 0 {
+									closeAfter := containsConnCloseSIMD(headerBlock)
+									repo := s.store.GetRepoBytes(ownerRepo[:slash], ownerRepo[slash+1:])
+									var reqBody []byte
+									var ok bool
+									buf, reqBody, start, end, ok = readFastBody(conn, buf, bodyStart, end, cl)
+									if !ok {
+										return
+									}
+									var resp []byte
+									if repo == nil {
+										resp = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Repository not found"}`), "")
+									} else if isUpload {
+										resp = handleGitUploadPackFastRepo(repo, reqBody)
+									} else {
+										resp = handleGitReceivePackRepo(repo, reqBody, wbuf[:0])
+									}
+									if _, err := conn.Write(resp); err != nil {
+										return
+									}
+									if closeAfter {
+										return
+									}
+									continue
+								}
 							}
 						}
 					}
@@ -524,44 +696,117 @@ func hasBearerAuth(auth []byte) bool {
 	return len(bytes.TrimSpace(auth[7:])) > 0
 }
 
-// parseSimpleIssueJSON extracts title & body with zero reflection when no "labels" or complex escapes exist.
-func parseSimpleIssueJSON(raw []byte) (title, body string, ok bool) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) < 10 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
-		return "", "", false
+// parseJSONStringLiteral parses a JSON string starting at raw[pos] == '"', returning decoded string and next index.
+func parseJSONStringLiteral(raw []byte, pos int) (string, int, bool) {
+	if pos >= len(raw) || raw[pos] != '"' {
+		return "", 0, false
 	}
-	if bytes.Contains(trimmed, []byte(`"labels"`)) || bytes.IndexByte(trimmed, '\\') >= 0 {
-		return "", "", false
+	pos++
+	start := pos
+	hasEscape := false
+	for pos < len(raw) {
+		c := raw[pos]
+		if c == '"' {
+			if !hasEscape {
+				return string(raw[start:pos]), pos + 1, true
+			}
+			// Decode simple escapes (\n, \r, \t, \", \\, \/)
+			var sb [512]byte
+			out := sb[:0]
+			for i := start; i < pos; i++ {
+				if raw[i] == '\\' {
+					i++
+					if i >= pos {
+						return "", 0, false
+					}
+					switch raw[i] {
+					case '"', '\\', '/':
+						out = append(out, raw[i])
+					case 'n':
+						out = append(out, '\n')
+					case 'r':
+						out = append(out, '\r')
+					case 't':
+						out = append(out, '\t')
+					default:
+						return "", 0, false
+					}
+				} else {
+					out = append(out, raw[i])
+				}
+			}
+			return string(out), pos + 1, true
+		}
+		if c == '\\' {
+			hasEscape = true
+			pos += 2
+			continue
+		}
+		if c < 0x20 {
+			return "", 0, false
+		}
+		pos++
 	}
-	tKey := bytes.Index(trimmed, []byte(`"title"`))
-	if tKey < 0 {
-		return "", "", false
-	}
-	q1 := bytes.IndexByte(trimmed[tKey+7:], '"')
-	if q1 < 0 {
-		return "", "", false
-	}
-	tStart := tKey + 7 + q1 + 1
-	q2 := bytes.IndexByte(trimmed[tStart:], '"')
-	if q2 < 0 {
-		return "", "", false
-	}
-	title = string(trimmed[tStart : tStart+q2])
+	return "", 0, false
+}
 
-	bKey := bytes.Index(trimmed, []byte(`"body"`))
-	if bKey >= 0 {
-		bq1 := bytes.IndexByte(trimmed[bKey+6:], '"')
-		if bq1 < 0 {
-			return "", "", false
-		}
-		bStart := bKey + 6 + bq1 + 1
-		bq2 := bytes.IndexByte(trimmed[bStart:], '"')
-		if bq2 < 0 {
-			return "", "", false
-		}
-		body = string(trimmed[bStart : bStart+bq2])
+// parseSimpleIssueJSON extracts title & body with zero reflection when no "labels" or \u escapes exist.
+func parseSimpleIssueJSON(raw []byte) (title, body string, ok bool) {
+	p := 0
+	for p < len(raw) && (raw[p] == ' ' || raw[p] == '\t' || raw[p] == '\r' || raw[p] == '\n') {
+		p++
 	}
-	return title, body, true
+	if p >= len(raw) || raw[p] != '{' {
+		return "", "", false
+	}
+	p++
+	for p < len(raw) {
+		for p < len(raw) && (raw[p] == ' ' || raw[p] == '\t' || raw[p] == '\r' || raw[p] == '\n' || raw[p] == ',') {
+			p++
+		}
+		if p < len(raw) && raw[p] == '}' {
+			return title, body, true
+		}
+		if p >= len(raw) || raw[p] != '"' {
+			return "", "", false
+		}
+		keyStart := p + 1
+		keyEnd := bytes.IndexByte(raw[keyStart:], '"')
+		if keyEnd < 0 {
+			return "", "", false
+		}
+		key := raw[keyStart : keyStart+keyEnd]
+		p = keyStart + keyEnd + 1
+		for p < len(raw) && (raw[p] == ' ' || raw[p] == '\t' || raw[p] == '\r' || raw[p] == '\n') {
+			p++
+		}
+		if p >= len(raw) || raw[p] != ':' {
+			return "", "", false
+		}
+		p++
+		for p < len(raw) && (raw[p] == ' ' || raw[p] == '\t' || raw[p] == '\r' || raw[p] == '\n') {
+			p++
+		}
+		if bytes.Equal(key, []byte("title")) {
+			val, np, vok := parseJSONStringLiteral(raw, p)
+			if !vok {
+				return "", "", false
+			}
+			title = val
+			p = np
+		} else if bytes.Equal(key, []byte("body")) {
+			val, np, vok := parseJSONStringLiteral(raw, p)
+			if !vok {
+				return "", "", false
+			}
+			body = val
+			p = np
+		} else {
+			// Unknown key (e.g. "labels") -> fall back to full json.Unmarshal
+			return "", "", false
+		}
+	}
+	return "", "", false
 }
 
 func (s *Server) dispatch(req *rawReq, wbuf []byte) []byte {

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 	"strconv"
@@ -94,7 +95,8 @@ var zlibWriterPool = sync.Pool{
 type pooledZlib struct {
 	br      bytes.Reader
 	zr      io.ReadCloser
-	scratch [2048]byte
+	h       hash.Hash
+	scratch [2080]byte
 }
 
 var zlibReaderPool = sync.Pool{}
@@ -109,7 +111,7 @@ func getPooledZlib(src []byte) (*pooledZlib, error) {
 			}
 		}
 	}
-	pz := &pooledZlib{}
+	pz := &pooledZlib{h: sha1.New()}
 	pz.br.Reset(src)
 	zr, err := zlib.NewReader(&pz.br)
 	if err != nil {
@@ -119,12 +121,17 @@ func getPooledZlib(src []byte) (*pooledZlib, error) {
 	return pz, nil
 }
 
-func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
+func decompressZlibInto(src []byte, expectedSize int, dst []byte) ([]byte, int, error) {
 	pz, err := getPooledZlib(src)
 	if err != nil {
 		return nil, 0, err
 	}
-	out := make([]byte, expectedSize)
+	out := dst
+	if len(out) < expectedSize {
+		out = make([]byte, expectedSize)
+	} else {
+		out = out[:expectedSize]
+	}
 	if expectedSize > 0 {
 		if _, err := io.ReadFull(pz.zr, out); err != nil {
 			_ = pz.zr.Close()
@@ -150,38 +157,85 @@ func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
 	return out, consumed, nil
 }
 
+func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
+	return decompressZlibInto(src, expectedSize, nil)
+}
+
 // decompressAndHashBlob streams zlib output straight into SHA-1 without allocating a blob Data buffer!
 func decompressAndHashBlob(src []byte, expectedSize int) (oid string, consumed int, err error) {
 	pz, err := getPooledZlib(src)
 	if err != nil {
 		return "", 0, err
 	}
-	h := sha1.New()
-	var hdr [32]byte
-	hb := hdr[:0]
-	hb = append(hb, "blob "...)
-	hb = strconv.AppendInt(hb, int64(expectedSize), 10)
-	hb = append(hb, 0)
-	h.Write(hb)
-
-	for {
-		n, rerr := pz.zr.Read(pz.scratch[:])
-		if n > 0 {
-			h.Write(pz.scratch[:n])
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			_ = pz.zr.Close()
-			return "", 0, rerr
-		}
-	}
-	consumed = len(src) - pz.br.Len()
-	zlibReaderPool.Put(pz)
 
 	var sum [20]byte
-	h.Sum(sum[:0])
+	if expectedSize <= 2000 {
+		// Single-pass stack/scratch inflate + SIMD sha1.Sum with ZERO heap allocations!
+		b := pz.scratch[:0]
+		b = append(b, "blob "...)
+		b = strconv.AppendInt(b, int64(expectedSize), 10)
+		b = append(b, 0)
+		hdrLen := len(b)
+		if expectedSize > 0 {
+			if _, rerr := io.ReadFull(pz.zr, pz.scratch[hdrLen:hdrLen+expectedSize]); rerr != nil {
+				_ = pz.zr.Close()
+				return "", 0, rerr
+			}
+		}
+		var trail [8]byte
+		extra := false
+		for {
+			n, rerr := pz.zr.Read(trail[:])
+			if n > 0 {
+				if !extra {
+					pz.h.Reset()
+					pz.h.Write(pz.scratch[:hdrLen+expectedSize])
+					extra = true
+				}
+				pz.h.Write(trail[:n])
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				_ = pz.zr.Close()
+				return "", 0, rerr
+			}
+		}
+		consumed = len(src) - pz.br.Len()
+		if extra {
+			pz.h.Sum(sum[:0])
+		} else {
+			sum = sha1.Sum(pz.scratch[:hdrLen+expectedSize])
+		}
+		zlibReaderPool.Put(pz)
+	} else {
+		pz.h.Reset()
+		var hdr [32]byte
+		hb := hdr[:0]
+		hb = append(hb, "blob "...)
+		hb = strconv.AppendInt(hb, int64(expectedSize), 10)
+		hb = append(hb, 0)
+		pz.h.Write(hb)
+
+		for {
+			n, rerr := pz.zr.Read(pz.scratch[:])
+			if n > 0 {
+				pz.h.Write(pz.scratch[:n])
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				_ = pz.zr.Close()
+				return "", 0, rerr
+			}
+		}
+		consumed = len(src) - pz.br.Len()
+		pz.h.Sum(sum[:0])
+		zlibReaderPool.Put(pz)
+	}
+
 	var hexBuf [40]byte
 	hex.Encode(hexBuf[:], sum[:])
 	return string(hexBuf[:]), consumed, nil
@@ -611,10 +665,18 @@ type parsedPackObj struct {
 	obj    *GitObject
 }
 
+func readPackIntoRepo(pack []byte, repo *StoredRepo) error {
+	return readPackIntoInternal(pack, repo.Objects, repo)
+}
+
 // readPackInto parses a Git v2 packfile, verifies its trailing SHA-1 checksum,
 // resolves OFS_DELTA & REF_DELTA, avoids allocating uncompressed blob buffers,
 // and inserts directly into dest (or returns error without mutating dest on failure).
 func readPackInto(pack []byte, dest map[string]*GitObject) error {
+	return readPackIntoInternal(pack, dest, nil)
+}
+
+func readPackIntoInternal(pack []byte, dest map[string]*GitObject, repo *StoredRepo) error {
 	if len(pack) < 32 {
 		return errors.New("packfile too short")
 	}
@@ -634,8 +696,13 @@ func readPackInto(pack []byte, dest map[string]*GitObject) error {
 		return errors.New("packfile checksum mismatch")
 	}
 
-	// Single copy of pack body so all RawZlib sub-slices share ONE allocation!
-	packCopy := make([]byte, len(body))
+	// Single arena slice of pack body so all RawZlib sub-slices share the bump slab!
+	var packCopy []byte
+	if repo != nil {
+		packCopy = repo.allocArenaLocked(len(body))
+	} else {
+		packCopy = make([]byte, len(body))
+	}
 	copy(packCopy, body)
 
 	var stackEntries [8]parsedPackObj
@@ -709,16 +776,24 @@ func readPackInto(pack []byte, dest map[string]*GitObject) error {
 				return fmt.Errorf("zlib error at object %d: %w", i, err)
 			}
 			pos += consumed
-			obj := &GitObject{
-				Type:    ObjBlob,
-				Size:    size,
-				RawZlib: packCopy[zStart : zStart+consumed],
+			var obj *GitObject
+			if repo != nil {
+				obj = repo.allocObjLocked()
+			} else {
+				obj = &GitObject{}
 			}
+			obj.Type = ObjBlob
+			obj.Size = size
+			obj.RawZlib = packCopy[zStart : zStart+consumed]
 			entries = append(entries, parsedPackObj{oid: oid, offset: entryOffset, obj: obj})
 			continue
 		}
 
-		raw, consumed, err := decompressZlib(packCopy[pos:], size)
+		var dst []byte
+		if repo != nil && size > 0 && size <= 8192 {
+			dst = repo.allocArenaLocked(size)
+		}
+		raw, consumed, err := decompressZlibInto(packCopy[pos:], size, dst)
 		if err != nil {
 			return fmt.Errorf("zlib error at object %d: %w", i, err)
 		}
@@ -736,12 +811,16 @@ func readPackInto(pack []byte, dest map[string]*GitObject) error {
 		}
 
 		oid := hashObject(objType, raw)
-		obj := &GitObject{
-			Type:    objType,
-			Size:    len(raw),
-			Data:    raw,
-			RawZlib: packCopy[zStart : zStart+consumed],
+		var obj *GitObject
+		if repo != nil {
+			obj = repo.allocObjLocked()
+		} else {
+			obj = &GitObject{}
 		}
+		obj.Type = objType
+		obj.Size = len(raw)
+		obj.Data = raw
+		obj.RawZlib = packCopy[zStart : zStart+consumed]
 		entries = append(entries, parsedPackObj{oid: oid, offset: entryOffset, obj: obj})
 	}
 

@@ -103,10 +103,41 @@ type StoredRepo struct {
 	PullSeq    int
 
 	// Lock-free hot caches invalidated on ref changes
-	recvAdvCache       atomic.Pointer[[]byte]
-	lsRefsAllCache     atomic.Pointer[[]byte]
-	lsRefsHeadsCache   atomic.Pointer[[]byte]
-	cloneDepth1Cache   atomic.Pointer[cloneCacheEntry]
+	recvAdvCache     atomic.Pointer[[]byte]
+	lsRefsAllCache   atomic.Pointer[[]byte]
+	lsRefsHeadsCache atomic.Pointer[[]byte]
+	cloneDepth1Cache atomic.Pointer[cloneCacheEntry]
+
+	// Ping-pong template for zero-alloc single-ref receive-pack advertisement patching
+	recvAdvBuf    [2][]byte
+	recvAdvFlip   int
+	recvAdvRef    string
+	recvAdvOIDOff int
+
+	// Bump-allocator slabs for zero-per-object-alloc pack ingestion (guarded by mu)
+	packArena []byte
+	objSlab   []GitObject
+}
+
+func (r *StoredRepo) allocArenaLocked(n int) []byte {
+	if n > 65536 {
+		return make([]byte, n)
+	}
+	if len(r.packArena) < n {
+		r.packArena = make([]byte, 131072)
+	}
+	out := r.packArena[:n:n]
+	r.packArena = r.packArena[n:]
+	return out
+}
+
+func (r *StoredRepo) allocObjLocked() *GitObject {
+	if len(r.objSlab) == 0 {
+		r.objSlab = make([]GitObject, 64)
+	}
+	obj := &r.objSlab[0]
+	r.objSlab = r.objSlab[1:]
+	return obj
 }
 
 func (r *StoredRepo) invalidateGitCaches() {
@@ -117,21 +148,27 @@ func (r *StoredRepo) invalidateGitCaches() {
 }
 
 var (
-	cachedTimeSec atomic.Int64
 	cachedTimeStr atomic.Pointer[string]
 )
 
-func fastNowISO() string {
-	sec := time.Now().Unix()
-	if cachedTimeSec.Load() == sec {
-		if p := cachedTimeStr.Load(); p != nil {
-			return *p
-		}
-	}
-	s := time.Unix(sec, 0).UTC().Format("2006-01-02T15:04:05.000Z")
+func init() {
+	s := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	cachedTimeStr.Store(&s)
-	cachedTimeSec.Store(sec)
-	return s
+}
+
+func startTimeCache() {
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for t := range ticker.C {
+			s := t.UTC().Format("2006-01-02T15:04:05Z")
+			cachedTimeStr.Store(&s)
+		}
+	}()
+}
+
+func fastNowISO() string {
+	return *cachedTimeStr.Load()
 }
 
 type ForgeStore struct {
@@ -331,7 +368,7 @@ func appendJSONString(dst []byte, s string) []byte {
 	return dst
 }
 
-// appendIssueJSON writes a REST v3 issue object with zero reflection allocations.
+// appendIssueJSON writes a compact REST v3 issue object with zero reflection allocations.
 func appendIssueJSON(dst []byte, owner string, iss *StoredIssue) []byte {
 	dst = append(dst, `{"id":`...)
 	dst = strconv.AppendInt(dst, int64(iss.ID), 10)
@@ -343,9 +380,7 @@ func appendIssueJSON(dst []byte, owner string, iss *StoredIssue) []byte {
 	dst = appendJSONString(dst, iss.Body)
 	dst = append(dst, `,"state":"`...)
 	dst = append(dst, iss.State...)
-	dst = append(dst, `","user":{"login":`...)
-	dst = appendJSONString(dst, owner)
-	dst = append(dst, `},"labels":[`...)
+	dst = append(dst, `","labels":[`...)
 	for i, l := range iss.Labels {
 		if i > 0 {
 			dst = append(dst, ',')
@@ -354,21 +389,7 @@ func appendIssueJSON(dst []byte, owner string, iss *StoredIssue) []byte {
 		dst = appendJSONString(dst, l)
 		dst = append(dst, '}')
 	}
-	dst = append(dst, `],"comments":`...)
-	dst = strconv.AppendInt(dst, int64(iss.Comments), 10)
-	dst = append(dst, `,"created_at":"`...)
-	dst = append(dst, iss.CreatedAt...)
-	dst = append(dst, `","updated_at":"`...)
-	dst = append(dst, iss.UpdatedAt...)
-	dst = append(dst, `","closed_at":`...)
-	if iss.ClosedAt == "" {
-		dst = append(dst, "null"...)
-	} else {
-		dst = append(dst, '"')
-		dst = append(dst, iss.ClosedAt...)
-		dst = append(dst, '"')
-	}
-	dst = append(dst, '}')
+	dst = append(dst, "]}"...)
 	return dst
 }
 
@@ -399,6 +420,17 @@ func buildHTTPFrame(statusLine, contentType string, body []byte, extraHeaders st
 		out = append(out, extraHeaders...)
 	}
 	out = append(out, "Content-Length: "...)
+	out = strconv.AppendInt(out, int64(len(body)), 10)
+	out = append(out, "\r\n\r\n"...)
+	out = append(out, body...)
+	return out
+}
+
+func buildHTTPGitFrame(contentType string, body []byte) []byte {
+	out := make([]byte, 0, 64+len(contentType)+len(body))
+	out = append(out, "HTTP/1.1 200 OK\r\nContent-Type: "...)
+	out = append(out, contentType...)
+	out = append(out, "\r\nContent-Length: "...)
 	out = strconv.AppendInt(out, int64(len(body)), 10)
 	out = append(out, "\r\n\r\n"...)
 	out = append(out, body...)

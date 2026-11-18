@@ -10,7 +10,9 @@ import (
 
 func main() {
 	// Reduce GC frequency inside the 1024 MiB sandbox for minimal p50 latency jitter
-	debug.SetGCPercent(400)
+	debug.SetGCPercent(800)
+	debug.SetMemoryLimit(768 << 20)
+	prewarmPools()
 
 	listenAddr := os.Getenv("FORGE_LISTEN_ADDR")
 	if listenAddr == "" {

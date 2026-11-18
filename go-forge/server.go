@@ -20,9 +20,38 @@ var (
 	respNotFound   = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Not Found"}`), "")
 	respBadJSON    = buildHTTPJSONFrame("400 Bad Request", []byte(`{"message":"Problems parsing JSON"}`), "")
 	respMethodNA   = buildHTTPJSONFrame("405 Method Not Allowed", []byte(`{"message":"Method Not Allowed"}`), "")
-	respNoContent  = []byte("HTTP/1.1 204 No Content\r\nContent-Type: application/json; charset=utf-8\r\nX-GitHub-Request-Id: gf-1\r\nContent-Length: 0\r\n\r\n")
+	respNoContent  = []byte("HTTP/1.1 204 No Content\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: 0\r\n\r\n")
 	reGitConfOwner = regexp.MustCompile(`git conformance for ([^/]+)/`)
+
+	connReadBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65536)
+			return &b
+		},
+	}
+	connWriteBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 0, 8192)
+			return &b
+		},
+	}
 )
+
+func prewarmPools() {
+	const n = 64
+	rb := make([]*[]byte, n)
+	wb := make([]*[]byte, n)
+	for i := 0; i < n; i++ {
+		r := make([]byte, 65536)
+		w := make([]byte, 0, 8192)
+		rb[i] = &r
+		wb[i] = &w
+	}
+	for i := 0; i < n; i++ {
+		connReadBufPool.Put(rb[i])
+		connWriteBufPool.Put(wb[i])
+	}
+}
 
 type Server struct {
 	store    *ForgeStore
@@ -99,9 +128,32 @@ func asciiEqualFold(a []byte, b string) bool {
 	return true
 }
 
+func containsBearerSIMD(hdr []byte) bool {
+	if bytes.Index(hdr, []byte("Bearer ")) >= 0 {
+		return true
+	}
+	return bytes.Index(hdr, []byte("bearer ")) >= 0
+}
+
+func containsConnCloseSIMD(hdr []byte) bool {
+	return bytes.Index(hdr, []byte("close")) >= 0 && (bytes.Index(hdr, []byte("Connection: close")) >= 0 || bytes.Index(hdr, []byte("connection: close")) >= 0)
+}
+
 func (s *Server) serveConn(conn net.Conn) {
-	buf := make([]byte, 65536)
-	wbuf := make([]byte, 0, 8192)
+	rbp := connReadBufPool.Get().(*[]byte)
+	wbp := connWriteBufPool.Get().(*[]byte)
+	buf := *rbp
+	wbuf := (*wbp)[:0]
+	defer func() {
+		if len(buf) <= 131072 {
+			*rbp = buf
+			connReadBufPool.Put(rbp)
+		}
+		if cap(wbuf) <= 65536 {
+			*wbp = wbuf[:0]
+			connWriteBufPool.Put(wbp)
+		}
+	}()
 	start := 0
 	end := 0
 
@@ -142,6 +194,94 @@ func (s *Server) serveConn(conn net.Conn) {
 
 		headerBlock := buf[start:hdrEnd]
 		bodyStart := hdrEnd + 4
+
+		// =========================================================================
+		// DIRECT SIMD ZERO-HEADER-LOOP FAST PATH A: GET /api/v3/repos/{o}/{r}/issues/{n}
+		// =========================================================================
+		if buf[start] == 'G' && bytes.HasPrefix(headerBlock, []byte("GET /api/v3/repos/")) {
+			if sp := bytes.IndexByte(headerBlock[18:], ' '); sp > 0 {
+				rest := headerBlock[18 : 18+sp]
+				if s1 := bytes.IndexByte(rest, '/'); s1 > 0 {
+					after1 := rest[s1+1:]
+					if s2 := bytes.IndexByte(after1, '/'); s2 > 0 {
+						after2 := after1[s2+1:]
+						if bytes.HasPrefix(after2, []byte("issues/")) {
+							numBytes := after2[7:]
+							if len(numBytes) > 0 && bytes.IndexByte(numBytes, '/') < 0 && bytes.IndexByte(numBytes, '?') < 0 {
+								num := parseDecimalBytes(numBytes)
+								if num > 0 && containsBearerSIMD(headerBlock) {
+									var resp []byte
+									repo := s.store.GetRepoBytes(rest[:s1], after1[:s2])
+									if repo == nil {
+										resp = respNotFound
+									} else if cached := repo.GetIssueCachedHTTP(num); cached != nil {
+										resp = cached
+									} else {
+										resp = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Issue not found"}`), "")
+									}
+									if _, err := conn.Write(resp); err != nil {
+										return
+									}
+									start = bodyStart
+									if start == end {
+										start = 0
+										end = 0
+									}
+									if containsConnCloseSIMD(headerBlock) {
+										return
+									}
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// =========================================================================
+		// DIRECT SIMD ZERO-HEADER-LOOP FAST PATH B: GET /{o}/{r}.git/info/refs?service=...
+		// =========================================================================
+		if buf[start] == 'G' && len(headerBlock) > 30 && headerBlock[4] == '/' {
+			firstNL := bytes.IndexByte(headerBlock, '\r')
+			if firstNL > 25 {
+				reqLine := headerBlock[:firstNL]
+				if gitIdx := bytes.Index(reqLine, []byte(".git/info/refs?service=")); gitIdx > 5 {
+					ownerRepo := reqLine[5:gitIdx]
+					if slash := bytes.IndexByte(ownerRepo, '/'); slash > 0 && bytes.IndexByte(ownerRepo[slash+1:], '/') < 0 {
+						svcPart := reqLine[gitIdx+23:]
+						if sp := bytes.IndexByte(svcPart, ' '); sp > 0 {
+							svc := svcPart[:sp]
+							repo := s.store.GetRepoBytes(ownerRepo[:slash], ownerRepo[slash+1:])
+							var resp []byte
+							if repo == nil {
+								resp = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Repository not found"}`), "")
+							} else if bytes.Equal(svc, []byte("git-upload-pack")) && bytes.Contains(headerBlock, []byte("version=2")) {
+								resp = uploadPackV2AdvHTTP
+							} else if bytes.Equal(svc, []byte("git-receive-pack")) {
+								if cached := repo.recvAdvCache.Load(); cached != nil {
+									resp = *cached
+								}
+							}
+							if resp != nil {
+								if _, err := conn.Write(resp); err != nil {
+									return
+								}
+								start = bodyStart
+								if start == end {
+									start = 0
+									end = 0
+								}
+								if containsConnCloseSIMD(headerBlock) {
+									return
+								}
+								continue
+							}
+						}
+					}
+				}
+			}
+		}
 
 		// Parse request line
 		firstNL := bytes.IndexByte(headerBlock, '\r')
@@ -488,15 +628,11 @@ func (s *Server) dispatch(req *rawReq, wbuf []byte) []byte {
 					title, body, labels = payload.Title, payload.Body, payload.Labels
 				}
 			}
-			_, jsonBody, err := repo.CreateIssue(title, body, labels)
+			out, err := repo.CreateIssueInto(title, body, labels, wbuf)
 			if err != nil {
 				return buildHTTPJSONFrame("422 Unprocessable Entity", []byte(`{"message":"Validation Failed"}`), "")
 			}
-			wbuf = append(wbuf, "HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\nX-GitHub-Request-Id: gf-1\r\nContent-Length: "...)
-			wbuf = strconv.AppendInt(wbuf, int64(len(jsonBody)), 10)
-			wbuf = append(wbuf, "\r\n\r\n"...)
-			wbuf = append(wbuf, jsonBody...)
-			return wbuf
+			return out
 		}
 	}
 

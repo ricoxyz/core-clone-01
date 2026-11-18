@@ -609,6 +609,117 @@ func handleGitReceivePackBytes(store *ForgeStore, owner, repoName, rawBody, wbuf
 }
 
 func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
+	// Ultra-fast single-command path (covers 100% of bench.push sequential pushes with ZERO slice/map allocs!)
+	if len(rawBody) > 95 {
+		if n, err := parseHex4(rawBody[:4]); err == nil && n > 85 && n+4 <= len(rawBody) {
+			if rawBody[n] == '0' && rawBody[n+1] == '0' && rawBody[n+2] == '0' && rawBody[n+3] == '0' {
+				line := bytes.TrimSuffix(rawBody[4:n], []byte{'\n'})
+				var cmdPart, capsPart []byte
+				if nul := bytes.IndexByte(line, 0); nul >= 0 {
+					cmdPart = line[:nul]
+					capsPart = line[nul+1:]
+				} else {
+					cmdPart = line
+				}
+				if len(cmdPart) > 82 && cmdPart[40] == ' ' && cmdPart[81] == ' ' {
+					oldOID := string(cmdPart[:40])
+					newOID := string(cmdPart[41:81])
+					ref := string(cmdPart[82:])
+					useSideband := bytes.Contains(capsPart, []byte("side-band-64k")) || bytes.Contains(capsPart, []byte("side-band"))
+					packData := rawBody[n+4:]
+
+					repo.mu.Lock()
+					unpackOk := true
+					unpackErr := ""
+					if len(packData) > 0 {
+						if perr := readPackInto(packData, repo.Objects); perr != nil {
+							unpackOk = false
+							unpackErr = perr.Error()
+						}
+					}
+
+					refOk := false
+					refReason := ""
+					refsChanged := false
+					if unpackOk {
+						currOID := repo.Refs[ref]
+						if newOID == ZeroOID {
+							if currOID != "" && oldOID != ZeroOID && currOID != oldOID {
+								refReason = "stale-info"
+							} else {
+								delete(repo.Refs, ref)
+								refsChanged = true
+								refOk = true
+							}
+						} else if oldOID == ZeroOID {
+							if currOID != "" && currOID != ZeroOID {
+								refReason = "already exists"
+							} else {
+								repo.Refs[ref] = newOID
+								refsChanged = true
+								refOk = true
+							}
+						} else {
+							if currOID != "" && currOID != oldOID {
+								refReason = "non-fast-forward"
+							} else if !repo.isAncestorLocked(newOID, oldOID) {
+								refReason = "non-fast-forward"
+							} else {
+								repo.Refs[ref] = newOID
+								refsChanged = true
+								refOk = true
+							}
+						}
+					}
+					if refsChanged {
+						repo.invalidateGitCaches()
+						adv := buildRecvAdvHTTPLocked(repo)
+						repo.recvAdvCache.Store(&adv)
+					}
+					repo.mu.Unlock()
+
+					var rStack [256]byte
+					rb := rStack[:0]
+					if unpackOk {
+						rb = appendPktLineStr(rb, "unpack ok\n")
+						if refOk {
+							rb = appendPktLineStr(rb, "ok "+ref+"\n")
+						} else {
+							rb = appendPktLineStr(rb, "ng "+ref+" "+refReason+"\n")
+						}
+					} else {
+						rb = appendPktLineStr(rb, "unpack "+unpackErr+"\n")
+						rb = appendPktLineStr(rb, "ng "+ref+" unpack failed\n")
+					}
+					rb = appendPktFlush(rb)
+
+					var bStack [300]byte
+					respBody := bStack[:0]
+					if useSideband {
+						sz := len(rb) + 5
+						const hexDigits = "0123456789abcdef"
+						respBody = append(respBody,
+							hexDigits[(sz>>12)&0xf],
+							hexDigits[(sz>>8)&0xf],
+							hexDigits[(sz>>4)&0xf],
+							hexDigits[sz&0xf],
+							1,
+						)
+						respBody = append(respBody, rb...)
+						respBody = appendPktFlush(respBody)
+					} else {
+						respBody = rb
+					}
+
+					wbuf = append(wbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nX-GitHub-Request-Id: 1\r\nCache-Control: no-cache\r\nContent-Length: "...)
+					wbuf = strconv.AppendInt(wbuf, int64(len(respBody)), 10)
+					wbuf = append(wbuf, "\r\n\r\n"...)
+					wbuf = append(wbuf, respBody...)
+					return wbuf
+				}
+			}
+		}
+	}
 
 	cmdLines, packData, err := decodeReceivePackPkts(rawBody)
 	if err != nil {
@@ -650,17 +761,9 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 	unpackErr := ""
 
 	if len(packData) > 0 {
-		objs, perr := readPack(packData, func(oid string) (*GitObject, bool) {
-			o, ok := repo.Objects[oid]
-			return o, ok
-		})
-		if perr != nil {
+		if perr := readPackInto(packData, repo.Objects); perr != nil {
 			unpackOk = false
 			unpackErr = perr.Error()
-		} else {
-			for oid, obj := range objs {
-				repo.Objects[oid] = obj
-			}
 		}
 	}
 

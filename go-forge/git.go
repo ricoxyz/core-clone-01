@@ -45,8 +45,24 @@ func (t GitObjType) String() string {
 
 type GitObject struct {
 	Type    GitObjType
+	Size    int
 	Data    []byte
 	RawZlib []byte // cached zlib-compressed payload for zero-deflate pack emission
+}
+
+// Bytes returns the uncompressed object bytes, inflating lazily from RawZlib for blobs if needed.
+func (o *GitObject) Bytes() []byte {
+	if o.Data != nil || o.Size == 0 {
+		return o.Data
+	}
+	if len(o.RawZlib) > 0 {
+		raw, _, err := decompressZlib(o.RawZlib, o.Size)
+		if err == nil {
+			o.Data = raw
+			return raw
+		}
+	}
+	return nil
 }
 
 type TreeEntry struct {
@@ -76,33 +92,37 @@ var zlibWriterPool = sync.Pool{
 }
 
 type pooledZlib struct {
-	br bytes.Reader
-	zr io.ReadCloser
+	br      bytes.Reader
+	zr      io.ReadCloser
+	scratch [2048]byte
 }
 
 var zlibReaderPool = sync.Pool{}
 
-func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
-	var pz *pooledZlib
+func getPooledZlib(src []byte) (*pooledZlib, error) {
 	if pooled := zlibReaderPool.Get(); pooled != nil {
-		pz = pooled.(*pooledZlib)
+		pz := pooled.(*pooledZlib)
 		pz.br.Reset(src)
 		if resetter, ok := pz.zr.(zlib.Resetter); ok {
-			if err := resetter.Reset(&pz.br, nil); err != nil {
-				pz = nil
+			if err := resetter.Reset(&pz.br, nil); err == nil {
+				return pz, nil
 			}
-		} else {
-			pz = nil
 		}
 	}
-	if pz == nil {
-		pz = &pooledZlib{}
-		pz.br.Reset(src)
-		zr, err := zlib.NewReader(&pz.br)
-		if err != nil {
-			return nil, 0, err
-		}
-		pz.zr = zr
+	pz := &pooledZlib{}
+	pz.br.Reset(src)
+	zr, err := zlib.NewReader(&pz.br)
+	if err != nil {
+		return nil, err
+	}
+	pz.zr = zr
+	return pz, nil
+}
+
+func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
+	pz, err := getPooledZlib(src)
+	if err != nil {
+		return nil, 0, err
 	}
 	out := make([]byte, expectedSize)
 	if expectedSize > 0 {
@@ -128,6 +148,43 @@ func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
 	consumed := len(src) - pz.br.Len()
 	zlibReaderPool.Put(pz)
 	return out, consumed, nil
+}
+
+// decompressAndHashBlob streams zlib output straight into SHA-1 without allocating a blob Data buffer!
+func decompressAndHashBlob(src []byte, expectedSize int) (oid string, consumed int, err error) {
+	pz, err := getPooledZlib(src)
+	if err != nil {
+		return "", 0, err
+	}
+	h := sha1.New()
+	var hdr [32]byte
+	hb := hdr[:0]
+	hb = append(hb, "blob "...)
+	hb = strconv.AppendInt(hb, int64(expectedSize), 10)
+	hb = append(hb, 0)
+	h.Write(hb)
+
+	for {
+		n, rerr := pz.zr.Read(pz.scratch[:])
+		if n > 0 {
+			h.Write(pz.scratch[:n])
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			_ = pz.zr.Close()
+			return "", 0, rerr
+		}
+	}
+	consumed = len(src) - pz.br.Len()
+	zlibReaderPool.Put(pz)
+
+	var sum [20]byte
+	h.Sum(sum[:0])
+	var hexBuf [40]byte
+	hex.Encode(hexBuf[:], sum[:])
+	return string(hexBuf[:]), consumed, nil
 }
 
 func compressZlib(data []byte) []byte {
@@ -548,31 +605,46 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 	return out, nil
 }
 
-// readPack parses a Git v2 packfile, verifies its trailing SHA-1 checksum,
-// resolves OFS_DELTA & REF_DELTA, and preserves raw compressed zlib bytes for fast re-emission.
-func readPack(pack []byte, resolveBase func(oid string) (*GitObject, bool)) (map[string]*GitObject, error) {
+type parsedPackObj struct {
+	oid    string
+	offset int
+	obj    *GitObject
+}
+
+// readPackInto parses a Git v2 packfile, verifies its trailing SHA-1 checksum,
+// resolves OFS_DELTA & REF_DELTA, avoids allocating uncompressed blob buffers,
+// and inserts directly into dest (or returns error without mutating dest on failure).
+func readPackInto(pack []byte, dest map[string]*GitObject) error {
 	if len(pack) < 32 {
-		return nil, errors.New("packfile too short")
+		return errors.New("packfile too short")
 	}
 	if pack[0] != 'P' || pack[1] != 'A' || pack[2] != 'C' || pack[3] != 'K' {
-		return nil, errors.New("invalid pack signature")
+		return errors.New("invalid pack signature")
 	}
 	ver := binary.BigEndian.Uint32(pack[4:8])
 	if ver != 2 {
-		return nil, fmt.Errorf("unsupported pack version %d", ver)
+		return fmt.Errorf("unsupported pack version %d", ver)
 	}
 	count := int(binary.BigEndian.Uint32(pack[8:12]))
 
-	// Verify trailing 20-byte SHA-1 checksum
 	body := pack[:len(pack)-20]
 	expectedTrailer := pack[len(pack)-20:]
 	sum := sha1.Sum(body)
 	if !bytes.Equal(sum[:], expectedTrailer) {
-		return nil, errors.New("packfile checksum mismatch")
+		return errors.New("packfile checksum mismatch")
 	}
 
-	objs := make(map[string]*GitObject, count)
-	byOffset := make(map[int]*GitObject, count)
+	// Single copy of pack body so all RawZlib sub-slices share ONE allocation!
+	packCopy := make([]byte, len(body))
+	copy(packCopy, body)
+
+	var stackEntries [8]parsedPackObj
+	var entries []parsedPackObj
+	if count <= len(stackEntries) {
+		entries = stackEntries[:0]
+	} else {
+		entries = make([]parsedPackObj, 0, count)
+	}
 
 	type pendingDelta struct {
 		offset  int
@@ -585,20 +657,20 @@ func readPack(pack []byte, resolveBase func(oid string) (*GitObject, bool)) (map
 
 	pos := 12
 	for i := 0; i < count; i++ {
-		if pos >= len(body) {
-			return nil, errors.New("unexpected end of packfile")
+		if pos >= len(packCopy) {
+			return errors.New("unexpected end of packfile")
 		}
 		entryOffset := pos
-		c := body[pos]
+		c := packCopy[pos]
 		pos++
 		objType := GitObjType((c >> 4) & 7)
 		size := int(c & 0x0f)
 		shift := 4
 		for c&0x80 != 0 {
-			if pos >= len(body) {
-				return nil, errors.New("truncated object header")
+			if pos >= len(packCopy) {
+				return errors.New("truncated object header")
 			}
-			c = body[pos]
+			c = packCopy[pos]
 			pos++
 			size |= int(c&0x7f) << shift
 			shift += 7
@@ -607,33 +679,48 @@ func readPack(pack []byte, resolveBase func(oid string) (*GitObject, bool)) (map
 		var baseOff int
 		var baseOID string
 		if objType == ObjOfsDelta {
-			if pos >= len(body) {
-				return nil, errors.New("truncated ofs-delta header")
+			if pos >= len(packCopy) {
+				return errors.New("truncated ofs-delta header")
 			}
-			b := body[pos]
+			b := packCopy[pos]
 			pos++
 			neg := int(b & 0x7f)
 			for b&0x80 != 0 {
-				if pos >= len(body) {
-					return nil, errors.New("truncated ofs-delta varint")
+				if pos >= len(packCopy) {
+					return errors.New("truncated ofs-delta varint")
 				}
-				b = body[pos]
+				b = packCopy[pos]
 				pos++
 				neg = ((neg + 1) << 7) | int(b&0x7f)
 			}
 			baseOff = entryOffset - neg
 		} else if objType == ObjRefDelta {
-			if pos+20 > len(body) {
-				return nil, errors.New("truncated ref-delta base oid")
+			if pos+20 > len(packCopy) {
+				return errors.New("truncated ref-delta base oid")
 			}
-			baseOID = hex.EncodeToString(body[pos : pos+20])
+			baseOID = hex.EncodeToString(packCopy[pos : pos+20])
 			pos += 20
 		}
 
 		zStart := pos
-		raw, consumed, err := decompressZlib(body[pos:], size)
+		if objType == ObjBlob {
+			oid, consumed, err := decompressAndHashBlob(packCopy[pos:], size)
+			if err != nil {
+				return fmt.Errorf("zlib error at object %d: %w", i, err)
+			}
+			pos += consumed
+			obj := &GitObject{
+				Type:    ObjBlob,
+				Size:    size,
+				RawZlib: packCopy[zStart : zStart+consumed],
+			}
+			entries = append(entries, parsedPackObj{oid: oid, offset: entryOffset, obj: obj})
+			continue
+		}
+
+		raw, consumed, err := decompressZlib(packCopy[pos:], size)
 		if err != nil {
-			return nil, fmt.Errorf("zlib error at object %d: %w", i, err)
+			return fmt.Errorf("zlib error at object %d: %w", i, err)
 		}
 		pos += consumed
 
@@ -648,61 +735,68 @@ func readPack(pack []byte, resolveBase func(oid string) (*GitObject, bool)) (map
 			continue
 		}
 
-		// Copy raw zlib slice so pack buffer can be GC'd cleanly
-		zCopy := make([]byte, consumed)
-		copy(zCopy, body[zStart:zStart+consumed])
-
 		oid := hashObject(objType, raw)
 		obj := &GitObject{
 			Type:    objType,
+			Size:    len(raw),
 			Data:    raw,
-			RawZlib: zCopy,
+			RawZlib: packCopy[zStart : zStart+consumed],
 		}
-		objs[oid] = obj
-		byOffset[entryOffset] = obj
+		entries = append(entries, parsedPackObj{oid: oid, offset: entryOffset, obj: obj})
 	}
 
-	// Resolve deltas (support chained deltas)
-	for len(pending) > 0 {
-		progressed := false
-		next := pending[:0]
-		for _, pd := range pending {
-			var base *GitObject
-			if pd.kind == ObjOfsDelta {
-				base = byOffset[pd.baseOff]
-			} else {
-				if b, ok := objs[pd.baseOID]; ok {
-					base = b
-				} else if resolveBase != nil {
-					if b, ok := resolveBase(pd.baseOID); ok {
+	// Resolve deltas only if present (zero map allocations when no deltas!)
+	if len(pending) > 0 {
+		byOffset := make(map[int]*GitObject, len(entries)+len(pending))
+		byOID := make(map[string]*GitObject, len(entries)+len(pending))
+		for _, e := range entries {
+			byOffset[e.offset] = e.obj
+			byOID[e.oid] = e.obj
+		}
+		for len(pending) > 0 {
+			progressed := false
+			next := pending[:0]
+			for _, pd := range pending {
+				var base *GitObject
+				if pd.kind == ObjOfsDelta {
+					base = byOffset[pd.baseOff]
+				} else {
+					if b, ok := byOID[pd.baseOID]; ok {
+						base = b
+					} else if b, ok := dest[pd.baseOID]; ok {
 						base = b
 					}
 				}
+				if base == nil {
+					next = append(next, pd)
+					continue
+				}
+				resolvedData, err := applyDelta(base.Bytes(), pd.delta)
+				if err != nil {
+					return err
+				}
+				oid := hashObject(base.Type, resolvedData)
+				obj := &GitObject{
+					Type: base.Type,
+					Size: len(resolvedData),
+					Data: resolvedData,
+				}
+				entries = append(entries, parsedPackObj{oid: oid, offset: pd.offset, obj: obj})
+				byOffset[pd.offset] = obj
+				byOID[oid] = obj
+				progressed = true
 			}
-			if base == nil {
-				next = append(next, pd)
-				continue
+			if !progressed {
+				return errors.New("unresolved delta base in packfile")
 			}
-			resolvedData, err := applyDelta(base.Data, pd.delta)
-			if err != nil {
-				return nil, err
-			}
-			oid := hashObject(base.Type, resolvedData)
-			obj := &GitObject{
-				Type: base.Type,
-				Data: resolvedData,
-			}
-			objs[oid] = obj
-			byOffset[pd.offset] = obj
-			progressed = true
+			pending = next
 		}
-		if !progressed {
-			return nil, errors.New("unresolved delta base in packfile")
-		}
-		pending = next
 	}
 
-	return objs, nil
+	for _, e := range entries {
+		dest[e.oid] = e.obj
+	}
+	return nil
 }
 
 // writePack encodes objects into a valid Git v2 packfile, reusing cached RawZlib bytes whenever available!
@@ -721,7 +815,10 @@ func writePack(objs []*GitObject) []byte {
 	binary.BigEndian.PutUint32(buf[8:12], uint32(len(objs)))
 
 	for _, o := range objs {
-		size := len(o.Data)
+		size := o.Size
+		if size == 0 && len(o.Data) > 0 {
+			size = len(o.Data)
+		}
 		first := byte((uint8(o.Type)&7)<<4) | byte(size&0x0f)
 		size >>= 4
 		if size > 0 {
@@ -738,7 +835,7 @@ func writePack(objs []*GitObject) []byte {
 		}
 		z := o.RawZlib
 		if len(z) == 0 {
-			z = compressZlib(o.Data)
+			z = compressZlib(o.Bytes())
 			o.RawZlib = z
 		}
 		buf = append(buf, z...)

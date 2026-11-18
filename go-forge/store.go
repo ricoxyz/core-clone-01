@@ -30,7 +30,7 @@ type StoredIssue struct {
 	UpdatedAt     string
 	ClosedAt      string
 	Comments      int
-	CachedGetHTTP []byte // Complete HTTP/1.1 200 OK response bytes for zero-alloc GET /issues/:n
+	cachedGetHTTP atomic.Pointer[[]byte] // Lazily built on first GET /issues/:n
 }
 
 type StoredComment struct {
@@ -374,10 +374,10 @@ func appendIssueJSON(dst []byte, owner string, iss *StoredIssue) []byte {
 
 // buildHTTPResponse wraps a JSON body into a single contiguous HTTP/1.1 response frame.
 func buildHTTPJSONFrame(statusLine string, body []byte, extraHeaders string) []byte {
-	out := make([]byte, 0, len(statusLine)+128+len(extraHeaders)+len(body))
+	out := make([]byte, 0, len(statusLine)+96+len(extraHeaders)+len(body))
 	out = append(out, "HTTP/1.1 "...)
 	out = append(out, statusLine...)
-	out = append(out, "\r\nContent-Type: application/json; charset=utf-8\r\nX-GitHub-Request-Id: gf-1\r\n"...)
+	out = append(out, "\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\n"...)
 	if extraHeaders != "" {
 		out = append(out, extraHeaders...)
 	}
@@ -389,12 +389,12 @@ func buildHTTPJSONFrame(statusLine string, body []byte, extraHeaders string) []b
 }
 
 func buildHTTPFrame(statusLine, contentType string, body []byte, extraHeaders string) []byte {
-	out := make([]byte, 0, len(statusLine)+128+len(contentType)+len(extraHeaders)+len(body))
+	out := make([]byte, 0, len(statusLine)+96+len(contentType)+len(extraHeaders)+len(body))
 	out = append(out, "HTTP/1.1 "...)
 	out = append(out, statusLine...)
 	out = append(out, "\r\nContent-Type: "...)
 	out = append(out, contentType...)
-	out = append(out, "\r\nX-GitHub-Request-Id: gf-1\r\n"...)
+	out = append(out, "\r\nX-GitHub-Request-Id: 1\r\n"...)
 	if extraHeaders != "" {
 		out = append(out, extraHeaders...)
 	}
@@ -405,13 +405,55 @@ func buildHTTPFrame(statusLine, contentType string, body []byte, extraHeaders st
 	return out
 }
 
-func (r *StoredRepo) refreshIssueCacheLocked(iss *StoredIssue) []byte {
+func (r *StoredRepo) buildIssueGetHTTPLocked(iss *StoredIssue) []byte {
 	body := appendIssueJSON(make([]byte, 0, 256+len(iss.Title)+len(iss.Body)), r.Owner, iss)
-	iss.CachedGetHTTP = buildHTTPJSONFrame("200 OK", body, "")
-	return body
+	frame := buildHTTPJSONFrame("200 OK", body, "")
+	iss.cachedGetHTTP.Store(&frame)
+	return frame
 }
 
-// CreateIssue creates an issue and returns both the issue and its pre-built JSON body.
+// CreateIssueInto creates an issue and writes its complete HTTP/1.1 201 Created frame directly into wbuf (zero extra JSON allocs!).
+func (r *StoredRepo) CreateIssueInto(title, body string, labels []string, wbuf []byte) ([]byte, error) {
+	r.mu.Lock()
+	for _, l := range labels {
+		if _, ok := r.Labels[strings.ToLower(l)]; !ok {
+			r.mu.Unlock()
+			return nil, errors.New("bad-label")
+		}
+	}
+	num := len(r.Issues) + 1
+	now := fastNowISO()
+	var lblCopy []string
+	if len(labels) > 0 {
+		lblCopy = make([]string, len(labels))
+		copy(lblCopy, labels)
+	}
+	iss := &StoredIssue{
+		ID:        num,
+		Number:    num,
+		Title:     title,
+		Body:      body,
+		State:     "open",
+		Labels:    lblCopy,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	r.Issues = append(r.Issues, iss)
+	r.lastIssue.Store(iss)
+	owner := r.Owner
+	r.mu.Unlock()
+
+	// Format JSON directly into stack/scratch buffer then wrap into wbuf
+	var stack [1024]byte
+	jbuf := appendIssueJSON(stack[:0], owner, iss)
+	wbuf = append(wbuf, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
+	wbuf = strconv.AppendInt(wbuf, int64(len(jbuf)), 10)
+	wbuf = append(wbuf, "\r\n\r\n"...)
+	wbuf = append(wbuf, jbuf...)
+	return wbuf, nil
+}
+
+// CreateIssue creates an issue and returns the issue.
 func (r *StoredRepo) CreateIssue(title, body string, labels []string) (*StoredIssue, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -437,16 +479,17 @@ func (r *StoredRepo) CreateIssue(title, body string, labels []string) (*StoredIs
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	jsonBody := r.refreshIssueCacheLocked(iss)
 	r.Issues = append(r.Issues, iss)
 	r.lastIssue.Store(iss)
-	return iss, jsonBody, nil
+	return iss, appendIssueJSON(make([]byte, 0, 256), r.Owner, iss), nil
 }
 
 // GetIssueCachedHTTP returns the pre-framed HTTP/1.1 200 OK bytes for GET /issues/:num lock-free!
 func (r *StoredRepo) GetIssueCachedHTTP(num int) []byte {
 	if li := r.lastIssue.Load(); li != nil && li.Number == num {
-		return li.CachedGetHTTP
+		if p := li.cachedGetHTTP.Load(); p != nil {
+			return *p
+		}
 	}
 	r.mu.RLock()
 	if num < 1 || num > len(r.Issues) {
@@ -454,10 +497,16 @@ func (r *StoredRepo) GetIssueCachedHTTP(num int) []byte {
 		return nil
 	}
 	iss := r.Issues[num-1]
-	resp := iss.CachedGetHTTP
+	p := iss.cachedGetHTTP.Load()
+	if p != nil {
+		r.mu.RUnlock()
+		r.lastIssue.Store(iss)
+		return *p
+	}
+	frame := r.buildIssueGetHTTPLocked(iss)
 	r.mu.RUnlock()
 	r.lastIssue.Store(iss)
-	return resp
+	return frame
 }
 
 func (r *StoredRepo) PatchIssue(num int, state, title, body *string) (*StoredIssue, []byte) {
@@ -483,7 +532,8 @@ func (r *StoredRepo) PatchIssue(num int, state, title, body *string) (*StoredIss
 		iss.Body = *body
 	}
 	iss.UpdatedAt = now
-	jsonBody := r.refreshIssueCacheLocked(iss)
+	iss.cachedGetHTTP.Store(nil)
+	jsonBody := appendIssueJSON(make([]byte, 0, 256+len(iss.Title)+len(iss.Body)), r.Owner, iss)
 	r.lastIssue.Store(iss)
 	return iss, jsonBody
 }
@@ -515,8 +565,8 @@ func (r *StoredRepo) CreateComment(issueNum int, body string) (*StoredComment, e
 	iss := r.Issues[issueNum-1]
 	r.CommentSeq++
 	iss.Comments++
-	r.refreshIssueCacheLocked(iss)
-	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	iss.cachedGetHTTP.Store(nil)
+	now := fastNowISO()
 	c := &StoredComment{
 		ID:          r.CommentSeq,
 		IssueNumber: issueNum,
@@ -571,7 +621,7 @@ func (r *StoredRepo) ListLabels() []*StoredLabel {
 func (r *StoredRepo) putObjectLocked(t GitObjType, data []byte) string {
 	oid := hashObject(t, data)
 	if _, ok := r.Objects[oid]; !ok {
-		r.Objects[oid] = &GitObject{Type: t, Data: data}
+		r.Objects[oid] = &GitObject{Type: t, Size: len(data), Data: data}
 	}
 	return oid
 }
@@ -677,7 +727,7 @@ func (r *StoredRepo) GetFileOrDir(refOrCommit, targetPath string) (isFile bool, 
 	if clean != "" {
 		if info, ok := allFiles[clean]; ok {
 			if bObj, ok := r.Objects[info.OID]; ok {
-				return true, bObj.Data, info.OID, nil, true
+				return true, bObj.Bytes(), info.OID, nil, true
 			}
 			return false, nil, "", nil, false
 		}
@@ -707,7 +757,10 @@ func (r *StoredRepo) GetFileOrDir(refOrCommit, targetPath string) (isFile bool, 
 			} else {
 				sz := 0
 				if bObj, ok := r.Objects[info.OID]; ok {
-					sz = len(bObj.Data)
+					sz = bObj.Size
+					if sz == 0 {
+						sz = len(bObj.Data)
+					}
 				}
 				ep := rel
 				if clean != "" {

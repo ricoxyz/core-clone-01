@@ -16,6 +16,11 @@
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
 
+import { spawn, type ChildProcess } from 'node:child_process';
+import { chmodSync, copyFileSync, existsSync, accessSync, constants as fsConstants } from 'node:fs';
+import { dirname, join } from 'node:path';
+import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { createApp } from './app.ts';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -76,30 +81,93 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  process.stdout.write('[entry] initializing GitHub-compatible git forge engine\n');
-  const server = createApp();
+/** Resolve and launch the static Linux amd64 Go forge binary when available. */
+async function launchStaticGoForge(): Promise<{ port: number; stop: () => void } | null> {
+  if (process.platform !== 'linux' || process.arch !== 'x64') {
+    return null;
+  }
+  const rootDir = dirname(fileURLToPath(import.meta.url));
+  let binPath = join(rootDir, 'forge-linux-amd64');
+  if (!existsSync(binPath)) {
+    return null;
+  }
+  try {
+    accessSync(binPath, fsConstants.X_OK);
+  } catch {
+    // /bot is mounted read-only; copy to /tmp and chmod +x if git lost execute bit
+    const tmpBin = '/tmp/forge-linux-amd64';
+    copyFileSync(binPath, tmpBin);
+    chmodSync(tmpBin, 0o755);
+    binPath = tmpBin;
+  }
 
-  const shutdown = () => {
+  const child: ChildProcess = spawn(binPath, [], {
+    env: { ...process.env, FORGE_LISTEN_ADDR: '0.0.0.0:0' },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+
+  const port = await new Promise<number>((resolve, reject) => {
+    const rl = readline.createInterface({ input: child.stdout! });
+    const onExit = (code: number | null) => reject(new Error(`go-forge exited prematurely with code ${code}`));
+    child.once('exit', onExit);
+    child.once('error', reject);
+    rl.once('line', (line) => {
+      rl.close();
+      child.off('exit', onExit);
+      const match = /^READY (\d+)/.exec(line.trim());
+      if (!match) {
+        reject(new Error(`unexpected go-forge banner: ${line}`));
+        return;
+      }
+      resolve(Number(match[1]));
+    });
+  });
+
+  const stop = () => {
     try {
-      server.close();
+      child.kill('SIGTERM');
     } catch {
       // ignore
     }
   };
+  return { port, stop };
+}
+
+/** Bound the port, register it, then wait for the env: the whole life of the process. */
+async function main(): Promise<void> {
+  process.stdout.write('[entry] initializing GitHub-compatible static Go git forge engine\n');
+
+  let port = 0;
+  let shutdown = () => {};
+
+  const native = await launchStaticGoForge();
+  if (native !== null) {
+    port = native.port;
+    shutdown = native.stop;
+    process.stdout.write(`[entry] static Go core listening on port ${port}\n`);
+  } else {
+    const server = createApp();
+    shutdown = () => {
+      try {
+        server.close();
+      } catch {
+        // ignore
+      }
+    };
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, () => resolve());
+    });
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
+    port = address.port;
+    process.stdout.write(`[entry] fallback TS server listening on port ${port}\n`);
+  }
+
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-
-  await register(address.port);
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();

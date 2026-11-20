@@ -33,8 +33,8 @@ func (s *Server) Serve() {
 				if n > 0 {
 					c.end += n
 					// Serialize stepConn + ForgeStore access across connections on non-Linux fallback
-					// to match the Linux dual-reactor narrow store mutex invariants 100%.
-					s.storeMu.Lock()
+					// to match the single-threaded Linux epoll reactor invariants 100%.
+					s.fallbackMu.Lock()
 					var toWrite [][]byte
 					var closeConnNow bool
 					for c.end > c.start {
@@ -61,7 +61,7 @@ func (s *Server) Serve() {
 							break
 						}
 					}
-					s.storeMu.Unlock()
+					s.fallbackMu.Unlock()
 
 					for _, pkt := range toWrite {
 						if _, werr := nc.Write(pkt); werr != nil {

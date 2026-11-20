@@ -8,15 +8,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"unsafe"
 )
 
-const soReusePort = 15
-
 func tuneRuntimeForContainer() {
-	// Run 2 Ps on the 2-CPU sandbox pod, one per OS-thread-pinned epoll reactor.
+	// Keep 2 Ps so P0 stays exclusively pinned to the LockOSThread RawSyscall reactor
+	// while P1 handles waitForEnvDone and signals without stealing P0.
 	runtime.GOMAXPROCS(2)
 }
 
@@ -41,42 +39,47 @@ func parseIPv4ListenAddr(addr string) ([4]byte, int) {
 	return ip, port
 }
 
-func openReusePortListener(ip [4]byte, port int) (fd int, epfd int, boundPort int, err error) {
-	fd, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
+func rawEventfd2() (int, syscall.Errno) {
+	r1, _, err := syscall.RawSyscall(syscall.SYS_EVENTFD2, 0, uintptr(syscall.O_NONBLOCK|syscall.O_CLOEXEC), 0)
+	if err != 0 {
+		return -1, err
+	}
+	return int(r1), 0
+}
+
+func (s *Server) Listen(addr string) (int, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("socket: %w", err)
+		return 0, fmt.Errorf("socket: %w", err)
 	}
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-	if rerr := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, soReusePort, 1); rerr != nil {
-		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("setsockopt SO_REUSEPORT: %w", rerr)
-	}
 	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 
+	ip, port := parseIPv4ListenAddr(addr)
 	sa := &syscall.SockaddrInet4{Port: port, Addr: ip}
 	if berr := syscall.Bind(fd, sa); berr != nil {
 		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("bind: %w", berr)
+		return 0, fmt.Errorf("bind: %w", berr)
 	}
-	// Large listen backlog (2048) on each SO_REUSEPORT socket prevents SYN drops on 50-way clone bursts.
+	// Large listen backlog (2048) ensures 50-way concurrent clone bursts never hit SYN drops.
 	if lerr := syscall.Listen(fd, 2048); lerr != nil {
 		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("listen: %w", lerr)
+		return 0, fmt.Errorf("listen: %w", lerr)
 	}
 	nsa, gerr := syscall.Getsockname(fd)
 	if gerr != nil {
 		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("getsockname: %w", gerr)
+		return 0, fmt.Errorf("getsockname: %w", gerr)
 	}
-	boundPort = port
+	boundPort := port
 	if inet4, ok := nsa.(*syscall.SockaddrInet4); ok {
 		boundPort = inet4.Port
 	}
 
-	epfd, err = syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("epoll_create1: %w", err)
+		return 0, fmt.Errorf("epoll_create1: %w", err)
 	}
 	ev := syscall.EpollEvent{
 		Events: syscall.EPOLLIN,
@@ -85,28 +88,29 @@ func openReusePortListener(ip [4]byte, port int) (fd int, epfd int, boundPort in
 	if cerr := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, fd, &ev); cerr != nil {
 		_ = syscall.Close(epfd)
 		_ = syscall.Close(fd)
-		return 0, 0, 0, fmt.Errorf("epoll_ctl add listen: %w", cerr)
-	}
-	return fd, epfd, boundPort, nil
-}
-
-func (s *Server) Listen(addr string) (int, error) {
-	ip, port := parseIPv4ListenAddr(addr)
-	fd0, ep0, boundPort, err := openReusePortListener(ip, port)
-	if err != nil {
-		return 0, err
-	}
-	fd1, ep1, _, err := openReusePortListener(ip, boundPort)
-	if err != nil {
-		_ = syscall.Close(ep0)
-		_ = syscall.Close(fd0)
-		return 0, err
+		return 0, fmt.Errorf("epoll_ctl add listen: %w", cerr)
 	}
 
-	s.listenFds[0] = fd0
-	s.epollFds[0] = ep0
-	s.listenFds[1] = fd1
-	s.epollFds[1] = ep1
+	wfd, werr := rawEventfd2()
+	if werr != 0 {
+		_ = syscall.Close(epfd)
+		_ = syscall.Close(fd)
+		return 0, fmt.Errorf("eventfd2: %w", werr)
+	}
+	wev := syscall.EpollEvent{
+		Events: syscall.EPOLLIN,
+		Fd:     int32(wfd),
+	}
+	if cerr := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, wfd, &wev); cerr != nil {
+		_ = syscall.Close(wfd)
+		_ = syscall.Close(epfd)
+		_ = syscall.Close(fd)
+		return 0, fmt.Errorf("epoll_ctl add eventfd: %w", cerr)
+	}
+
+	s.listenFd = fd
+	s.epollFd = epfd
+	s.wakeFd = wfd
 	return boundPort, nil
 }
 
@@ -154,23 +158,36 @@ func rawClose(fd int) {
 	_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(fd), 0, 0)
 }
 
-func (s *Server) Serve() {
-	lfd0, epfd0 := s.listenFds[0], s.epollFds[0]
-	lfd1, epfd1 := s.listenFds[1], s.epollFds[1]
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.serveReactor(lfd1, epfd1)
-	}()
-	s.serveReactor(lfd0, epfd0)
-	wg.Wait()
+// rawEpollPwaitBlock blocks directly inside SYS_EPOLL_PWAIT (timeout -1) via RawSyscall6,
+// bypassing Go runtime entersyscallblock/exitsyscall P handoffs and futex/nanosleep churn.
+func rawEpollPwaitBlock(epfd int, events []syscall.EpollEvent) (int, syscall.Errno) {
+	r1, _, err := syscall.RawSyscall6(
+		syscall.SYS_EPOLL_PWAIT,
+		uintptr(epfd),
+		uintptr(unsafe.Pointer(&events[0])),
+		uintptr(len(events)),
+		^uintptr(0),
+		0,
+		0,
+	)
+	if err != 0 {
+		return -1, err
+	}
+	return int(r1), 0
 }
 
-func (s *Server) serveReactor(listenFd, epollFd int) {
+func (s *Server) Serve() {
+	if !s.serving.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.cleanupFds()
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	listenFd := s.listenFd
+	epollFd := s.epollFd
+	wakeFd := s.wakeFd
 
 	var conns [4096]*connState
 	connSlab := make([]connState, 128)
@@ -197,9 +214,9 @@ func (s *Server) serveReactor(listenFd, epollFd int) {
 	}
 
 	for {
-		n, err := syscall.EpollWait(epollFd, events[:], -1)
-		if err != nil {
-			if err == syscall.EINTR {
+		n, errno := rawEpollPwaitBlock(epollFd, events[:])
+		if errno != 0 {
+			if errno == syscall.EINTR {
 				continue
 			}
 			return
@@ -207,6 +224,12 @@ func (s *Server) serveReactor(listenFd, epollFd int) {
 		for i := 0; i < n; i++ {
 			fd := int(events[i].Fd)
 			evMask := events[i].Events
+
+			if fd == wakeFd {
+				var scratch [8]byte
+				_, _ = rawRead(wakeFd, scratch[:])
+				return
+			}
 
 			if fd == listenFd {
 				// Drain all queued connections until EAGAIN; set TCP_NODELAY once on accept.
@@ -284,10 +307,7 @@ func (s *Server) serveReactor(listenFd, epollFd int) {
 						needQuickAckPending = false
 						wantMoreRead := false
 						for c.end > c.start && len(c.outPending) == 0 {
-							s.storeMu.Lock()
 							resp, needMore, needQuickAck, closeAfter, fatal := s.stepConn(c)
-							s.storeMu.Unlock()
-
 							if fatal {
 								closeConnNow = true
 								break
@@ -403,17 +423,29 @@ func flushPendingLinux(epfd, fd int, c *connState) bool {
 	return true
 }
 
+func (s *Server) cleanupFds() {
+	if s.listenFd > 0 {
+		rawClose(s.listenFd)
+		s.listenFd = 0
+	}
+	if s.wakeFd > 0 {
+		rawClose(s.wakeFd)
+		s.wakeFd = 0
+	}
+	if s.epollFd > 0 {
+		rawClose(s.epollFd)
+		s.epollFd = 0
+	}
+}
+
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
-		for i := 0; i < 2; i++ {
-			if s.listenFds[i] > 0 {
-				_ = syscall.Close(s.listenFds[i])
-				s.listenFds[i] = 0
-			}
-			if s.epollFds[i] > 0 {
-				_ = syscall.Close(s.epollFds[i])
-				s.epollFds[i] = 0
-			}
+		if s.wakeFd > 0 {
+			var one uint64 = 1
+			_, _, _ = syscall.RawSyscall(syscall.SYS_WRITE, uintptr(s.wakeFd), uintptr(unsafe.Pointer(&one)), 8)
+		}
+		if s.serving.CompareAndSwap(false, true) {
+			s.cleanupFds()
 		}
 	})
 }

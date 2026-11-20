@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var (
@@ -26,12 +27,14 @@ var (
 func prewarmPools() {}
 
 type Server struct {
-	store     *ForgeStore
-	listener  net.Listener
-	listenFds [2]int
-	epollFds  [2]int
-	storeMu   sync.Mutex
-	closeOnce sync.Once
+	store      *ForgeStore
+	listener   net.Listener
+	listenFd   int
+	epollFd    int
+	wakeFd     int
+	serving    atomic.Bool
+	fallbackMu sync.Mutex
+	closeOnce  sync.Once
 }
 
 func NewServer(store *ForgeStore) *Server {

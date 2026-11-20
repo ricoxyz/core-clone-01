@@ -86,10 +86,10 @@ func TestV8ConcurrentStoreMuTwoReactors(t *testing.T) {
 				copy(c.buf[c.end:], raw)
 				c.end += len(raw)
 
-				srv.storeMu.Lock()
+				srv.fallbackMu.Lock()
 				resp, needMore, _, closeAfter, fatal := srv.stepConn(c)
 				out := append([]byte(nil), resp...)
-				srv.storeMu.Unlock()
+				srv.fallbackMu.Unlock()
 
 				if fatal || needMore || closeAfter || !bytes.Contains(out, []byte("201 Created")) {
 					errs <- fmt.Errorf("reactor %d iter %d unexpected result: needMore=%v close=%v fatal=%v resp=%s",

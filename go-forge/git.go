@@ -13,10 +13,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 const ZeroOID = "0000000000000000000000000000000000000000"
+
+var zeroOIDBytes = []byte(ZeroOID)
 
 type GitObjType uint8
 
@@ -85,44 +86,40 @@ type ParsedTag struct {
 	Tag    string
 }
 
-var zlibWriterPool = sync.Pool{
-	New: func() any {
-		w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
-		return w
-	},
+// Single-threaded persistent zlib readers/writers (no sync.Pool overhead on reactor hot path)
+var (
+	reactorZlibBr      bytes.Reader
+	reactorZlibZr      io.ReadCloser
+	reactorSha1        hash.Hash = sha1.New()
+	reactorScratch     [2080]byte
+	reactorZlibWFast   *zlib.Writer
+	reactorZlibWBest   *zlib.Writer
+)
+
+func init() {
+	reactorZlibWFast, _ = zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
+	reactorZlibWBest, _ = zlib.NewWriterLevel(io.Discard, zlib.BestCompression)
 }
 
-type pooledZlib struct {
-	br      bytes.Reader
-	zr      io.ReadCloser
-	h       hash.Hash
-	scratch [2080]byte
-}
-
-var zlibReaderPool = sync.Pool{}
-
-func getPooledZlib(src []byte) (*pooledZlib, error) {
-	if pooled := zlibReaderPool.Get(); pooled != nil {
-		pz := pooled.(*pooledZlib)
-		pz.br.Reset(src)
-		if resetter, ok := pz.zr.(zlib.Resetter); ok {
-			if err := resetter.Reset(&pz.br, nil); err == nil {
-				return pz, nil
+func resetReactorZlibReader(src []byte) (io.ReadCloser, error) {
+	reactorZlibBr.Reset(src)
+	if reactorZlibZr != nil {
+		if resetter, ok := reactorZlibZr.(zlib.Resetter); ok {
+			if err := resetter.Reset(&reactorZlibBr, nil); err == nil {
+				return reactorZlibZr, nil
 			}
 		}
 	}
-	pz := &pooledZlib{h: sha1.New()}
-	pz.br.Reset(src)
-	zr, err := zlib.NewReader(&pz.br)
+	zr, err := zlib.NewReader(&reactorZlibBr)
 	if err != nil {
 		return nil, err
 	}
-	pz.zr = zr
-	return pz, nil
+	reactorZlibZr = zr
+	return zr, nil
 }
 
 func decompressZlibInto(src []byte, expectedSize int, dst []byte) ([]byte, int, error) {
-	pz, err := getPooledZlib(src)
+	zr, err := resetReactorZlibReader(src)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -133,27 +130,24 @@ func decompressZlibInto(src []byte, expectedSize int, dst []byte) ([]byte, int, 
 		out = out[:expectedSize]
 	}
 	if expectedSize > 0 {
-		if _, err := io.ReadFull(pz.zr, out); err != nil {
-			_ = pz.zr.Close()
+		if _, err := io.ReadFull(zr, out); err != nil {
 			return nil, 0, err
 		}
 	}
 	var trail [8]byte
 	for {
-		n, err := pz.zr.Read(trail[:])
+		n, err := zr.Read(trail[:])
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			_ = pz.zr.Close()
 			return nil, 0, err
 		}
 		if n > 0 {
 			out = append(out, trail[:n]...)
 		}
 	}
-	consumed := len(src) - pz.br.Len()
-	zlibReaderPool.Put(pz)
+	consumed := len(src) - reactorZlibBr.Len()
 	return out, consumed, nil
 }
 
@@ -163,77 +157,71 @@ func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
 
 // decompressAndHashBlob streams zlib output straight into SHA-1 without allocating a blob Data buffer!
 func decompressAndHashBlob(src []byte, expectedSize int) (oid string, consumed int, err error) {
-	pz, err := getPooledZlib(src)
+	zr, err := resetReactorZlibReader(src)
 	if err != nil {
 		return "", 0, err
 	}
 
 	var sum [20]byte
 	if expectedSize <= 2000 {
-		// Single-pass stack/scratch inflate + SIMD sha1.Sum with ZERO heap allocations!
-		b := pz.scratch[:0]
+		b := reactorScratch[:0]
 		b = append(b, "blob "...)
 		b = strconv.AppendInt(b, int64(expectedSize), 10)
 		b = append(b, 0)
 		hdrLen := len(b)
 		if expectedSize > 0 {
-			if _, rerr := io.ReadFull(pz.zr, pz.scratch[hdrLen:hdrLen+expectedSize]); rerr != nil {
-				_ = pz.zr.Close()
+			if _, rerr := io.ReadFull(zr, reactorScratch[hdrLen:hdrLen+expectedSize]); rerr != nil {
 				return "", 0, rerr
 			}
 		}
 		var trail [8]byte
 		extra := false
 		for {
-			n, rerr := pz.zr.Read(trail[:])
+			n, rerr := zr.Read(trail[:])
 			if n > 0 {
 				if !extra {
-					pz.h.Reset()
-					pz.h.Write(pz.scratch[:hdrLen+expectedSize])
+					reactorSha1.Reset()
+					reactorSha1.Write(reactorScratch[:hdrLen+expectedSize])
 					extra = true
 				}
-				pz.h.Write(trail[:n])
+				reactorSha1.Write(trail[:n])
 			}
 			if rerr == io.EOF {
 				break
 			}
 			if rerr != nil {
-				_ = pz.zr.Close()
 				return "", 0, rerr
 			}
 		}
-		consumed = len(src) - pz.br.Len()
+		consumed = len(src) - reactorZlibBr.Len()
 		if extra {
-			pz.h.Sum(sum[:0])
+			reactorSha1.Sum(sum[:0])
 		} else {
-			sum = sha1.Sum(pz.scratch[:hdrLen+expectedSize])
+			sum = sha1.Sum(reactorScratch[:hdrLen+expectedSize])
 		}
-		zlibReaderPool.Put(pz)
 	} else {
-		pz.h.Reset()
+		reactorSha1.Reset()
 		var hdr [32]byte
 		hb := hdr[:0]
 		hb = append(hb, "blob "...)
 		hb = strconv.AppendInt(hb, int64(expectedSize), 10)
 		hb = append(hb, 0)
-		pz.h.Write(hb)
+		reactorSha1.Write(hb)
 
 		for {
-			n, rerr := pz.zr.Read(pz.scratch[:])
+			n, rerr := zr.Read(reactorScratch[:])
 			if n > 0 {
-				pz.h.Write(pz.scratch[:n])
+				reactorSha1.Write(reactorScratch[:n])
 			}
 			if rerr == io.EOF {
 				break
 			}
 			if rerr != nil {
-				_ = pz.zr.Close()
 				return "", 0, rerr
 			}
 		}
-		consumed = len(src) - pz.br.Len()
-		pz.h.Sum(sum[:0])
-		zlibReaderPool.Put(pz)
+		consumed = len(src) - reactorZlibBr.Len()
+		reactorSha1.Sum(sum[:0])
 	}
 
 	var hexBuf [40]byte
@@ -244,18 +232,24 @@ func decompressAndHashBlob(src []byte, expectedSize int) (oid string, consumed i
 func compressZlib(data []byte) []byte {
 	var buf bytes.Buffer
 	buf.Grow(len(data)/2 + 32)
-	w := zlibWriterPool.Get().(*zlib.Writer)
-	w.Reset(&buf)
-	_, _ = w.Write(data)
-	_ = w.Close()
-	zlibWriterPool.Put(w)
+	reactorZlibWFast.Reset(&buf)
+	_, _ = reactorZlibWFast.Write(data)
+	_ = reactorZlibWFast.Close()
 	return buf.Bytes()
 }
 
-func hashObject(t GitObjType, data []byte) string {
+func compressZlibBest(data []byte) []byte {
+	var buf bytes.Buffer
+	buf.Grow(len(data)/2 + 32)
+	reactorZlibWBest.Reset(&buf)
+	_, _ = reactorZlibWBest.Write(data)
+	_ = reactorZlibWBest.Close()
+	return buf.Bytes()
+}
+
+func hashObjectBytes(t GitObjType, data []byte, outHex *[40]byte) {
 	var sum [20]byte
 	if len(data) <= 2000 {
-		// Stack-allocated single-pass SHA-1 (zero heap escape for all bench.push blobs/trees/commits!)
 		var stack [2048]byte
 		b := stack[:0]
 		b = append(b, t.String()...)
@@ -265,19 +259,23 @@ func hashObject(t GitObjType, data []byte) string {
 		b = append(b, data...)
 		sum = sha1.Sum(b)
 	} else {
-		h := sha1.New()
+		reactorSha1.Reset()
 		var hdr [32]byte
 		b := hdr[:0]
 		b = append(b, t.String()...)
 		b = append(b, ' ')
 		b = strconv.AppendInt(b, int64(len(data)), 10)
 		b = append(b, 0)
-		h.Write(b)
-		h.Write(data)
-		h.Sum(sum[:0])
+		reactorSha1.Write(b)
+		reactorSha1.Write(data)
+		reactorSha1.Sum(sum[:0])
 	}
+	hex.Encode(outHex[:], sum[:])
+}
+
+func hashObject(t GitObjType, data []byte) string {
 	var hexBuf [40]byte
-	hex.Encode(hexBuf[:], sum[:])
+	hashObjectBytes(t, data, &hexBuf)
 	return string(hexBuf[:])
 }
 
@@ -323,15 +321,38 @@ func parseCommit(data []byte) ParsedCommit {
 	return res
 }
 
+// fastFirstParentBytes returns the first parent OID slice of a commit without allocating a string or slice.
+func fastFirstParentBytes(data []byte) []byte {
+	if len(data) >= 94 && bytes.HasPrefix(data, []byte("tree ")) && data[45] == '\n' && bytes.HasPrefix(data[46:], []byte("parent ")) {
+		return data[53:93]
+	}
+	sep := bytes.Index(data, []byte("\n\n"))
+	header := data
+	if sep >= 0 {
+		header = data[:sep]
+	}
+	for len(header) > 0 {
+		nl := bytes.IndexByte(header, '\n')
+		var line []byte
+		if nl < 0 {
+			line = header
+			header = nil
+		} else {
+			line = header[:nl]
+			header = header[nl+1:]
+		}
+		if bytes.HasPrefix(line, []byte("parent ")) && len(line) >= 47 {
+			return line[7:47]
+		}
+	}
+	return nil
+}
+
 // fastFirstParent returns the first parent OID of a commit without allocating a slice.
 func fastFirstParent(data []byte) string {
-	// Usually line 1 is "tree <40>\n", line 2 is "parent <40>\n"
-	if len(data) >= 94 && bytes.HasPrefix(data, []byte("tree ")) && data[45] == '\n' && bytes.HasPrefix(data[46:], []byte("parent ")) {
-		return string(data[53:93])
-	}
-	p := parseCommit(data)
-	if len(p.Parents) > 0 {
-		return p.Parents[0]
+	b := fastFirstParentBytes(data)
+	if len(b) == 40 {
+		return string(b)
 	}
 	return ""
 }
@@ -669,39 +690,39 @@ func readPackIntoRepo(pack []byte, repo *StoredRepo) error {
 	return readPackIntoInternal(pack, repo.Objects, repo)
 }
 
-// ingestPackDeferredLocked validates the Git v2 packfile header and trailing 20-byte SHA-1 checksum,
-// and skips inflating blobs/trees by queueing the raw pack for lazy materialization.
-// When needCommitOID is non-empty, it extracts and cryptographically verifies ONLY that commit object
-// (so fast-forward ancestry checks run in O(1) without inflating blobs or trees).
-// Returns fastUsed=false if needCommitOID is not found as a plain commit (caller falls back to full unpack).
-func ingestPackDeferredLocked(pack []byte, repo *StoredRepo, needCommitOID string) (fastUsed bool, err error) {
+// ingestPackFastForwardMain validates the Git v2 packfile header + trailing SHA-1,
+// locates and verifies the plain commit object matching newOID40 in stack scratch memory,
+// checks that its first parent equals oldOID40 (when oldOID40 != ZeroOID), and queues the pack
+// into pendingPacks with ZERO map inserts and ZERO heap string allocations.
+func ingestPackFastForwardMain(pack []byte, repo *StoredRepo, oldOID40, newOID40 []byte) (fastOK bool, parentMatched bool, err error) {
 	if len(pack) < 32 {
-		return false, errors.New("packfile too short")
+		return false, false, errors.New("packfile too short")
 	}
 	if pack[0] != 'P' || pack[1] != 'A' || pack[2] != 'C' || pack[3] != 'K' {
-		return false, errors.New("invalid pack signature")
+		return false, false, errors.New("invalid pack signature")
 	}
 	ver := binary.BigEndian.Uint32(pack[4:8])
 	if ver != 2 {
-		return false, fmt.Errorf("unsupported pack version %d", ver)
+		return false, false, fmt.Errorf("unsupported pack version %d", ver)
 	}
 	body := pack[:len(pack)-20]
 	expectedTrailer := pack[len(pack)-20:]
 	sum := sha1.Sum(body)
 	if !bytes.Equal(sum[:], expectedTrailer) {
-		return false, errors.New("packfile checksum mismatch")
+		return false, false, errors.New("packfile checksum mismatch")
 	}
 
-	if needCommitOID == "" {
+	if bytes.Equal(oldOID40, zeroOIDBytes) {
 		packCopy := repo.allocArenaLocked(len(pack))
 		copy(packCopy, pack)
 		repo.pendingPacks = append(repo.pendingPacks, packCopy)
-		repo.hasPendingPacks.Store(true)
-		return true, nil
+		repo.hasPendingPacks = true
+		return true, true, nil
 	}
 
-	// Scan backwards from the end of the pack body for a plain ObjCommit zlib stream matching needCommitOID
+	// Scan backwards from the end of the pack body for a plain ObjCommit zlib stream matching newOID40
 	var scratch [2048]byte
+	var calcHex [40]byte
 	for i := len(body) - 6; i >= 13; i-- {
 		if body[i] != 0x78 {
 			continue
@@ -710,7 +731,6 @@ func ingestPackDeferredLocked(pack []byte, repo *StoredRepo, needCommitOID strin
 		if b1 != 0x9c && b1 != 0x01 && b1 != 0x5e && b1 != 0xda {
 			continue
 		}
-		// Check 2-byte varint header (16 <= size < 2048, covers almost all commits)
 		size := -1
 		if i >= 14 {
 			h0, h1 := body[i-2], body[i-1]
@@ -721,7 +741,6 @@ func ingestPackDeferredLocked(pack []byte, repo *StoredRepo, needCommitOID strin
 				}
 			}
 		}
-		// Fallback check 3-byte varint header (2048 <= size < 65536)
 		if size < 0 && i >= 15 {
 			h0, h1, h2 := body[i-3], body[i-2], body[i-1]
 			if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 != 0 && h2&0x80 == 0 {
@@ -738,28 +757,25 @@ func ingestPackDeferredLocked(pack []byte, repo *StoredRepo, needCommitOID strin
 		if size <= len(scratch) {
 			dst = scratch[:size]
 		}
-		raw, consumed, derr := decompressZlibInto(body[i:], size, dst)
+		raw, _, derr := decompressZlibInto(body[i:], size, dst)
 		if derr != nil || len(raw) != size {
 			continue
 		}
-		if hashObject(ObjCommit, raw) == needCommitOID {
-			// Cryptographically verified commit object! Store commit + defer rest of pack.
-			packCopy := repo.allocArenaLocked(len(pack))
-			copy(packCopy, pack)
-			commitData := repo.allocArenaLocked(len(raw))
-			copy(commitData, raw)
-			obj := repo.allocObjLocked()
-			obj.Type = ObjCommit
-			obj.Size = len(commitData)
-			obj.Data = commitData
-			obj.RawZlib = packCopy[i : i+consumed]
-			repo.Objects[needCommitOID] = obj
-			repo.pendingPacks = append(repo.pendingPacks, packCopy)
-			repo.hasPendingPacks.Store(true)
-			return true, nil
+		hashObjectBytes(ObjCommit, raw, &calcHex)
+		if bytes.Equal(calcHex[:], newOID40) {
+			fp := fastFirstParentBytes(raw)
+			if len(fp) == 40 && bytes.Equal(fp, oldOID40) {
+				packCopy := repo.allocArenaLocked(len(pack))
+				copy(packCopy, pack)
+				repo.pendingPacks = append(repo.pendingPacks, packCopy)
+				repo.hasPendingPacks = true
+				return true, true, nil
+			}
+			// Found the new commit, but its first parent is not oldOID40 (could be multi-step or non-FF)
+			return false, false, nil
 		}
 	}
-	return false, nil
+	return false, false, nil
 }
 
 // readPackInto parses a Git v2 packfile, verifies its trailing SHA-1 checksum,
@@ -789,7 +805,6 @@ func readPackIntoInternal(pack []byte, dest map[string]*GitObject, repo *StoredR
 		return errors.New("packfile checksum mismatch")
 	}
 
-	// Single arena slice of pack body so all RawZlib sub-slices share the bump slab!
 	var packCopy []byte
 	if repo != nil {
 		packCopy = repo.allocArenaLocked(len(body))
@@ -917,7 +932,6 @@ func readPackIntoInternal(pack []byte, dest map[string]*GitObject, repo *StoredR
 		entries = append(entries, parsedPackObj{oid: oid, offset: entryOffset, obj: obj})
 	}
 
-	// Resolve deltas only if present (zero map allocations when no deltas!)
 	if len(pending) > 0 {
 		byOffset := make(map[int]*GitObject, len(entries)+len(pending))
 		byOID := make(map[string]*GitObject, len(entries)+len(pending))
@@ -973,9 +987,19 @@ func readPackIntoInternal(pack []byte, dest map[string]*GitObject, repo *StoredR
 
 // writePack encodes objects into a valid Git v2 packfile, reusing cached RawZlib bytes whenever available!
 func writePack(objs []*GitObject) []byte {
+	return writePackWithCompression(objs, false)
+}
+
+// writePackLevel9 recompresses objects at zlib level 9 (BestCompression) for the cached depth-1 clone response,
+// minimizing wire payload size and client SHA-1 checksum cost across 150 concurrent clones.
+func writePackLevel9(objs []*GitObject) []byte {
+	return writePackWithCompression(objs, true)
+}
+
+func writePackWithCompression(objs []*GitObject, forceLevel9 bool) []byte {
 	est := 32
 	for _, o := range objs {
-		if len(o.RawZlib) > 0 {
+		if !forceLevel9 && len(o.RawZlib) > 0 {
 			est += len(o.RawZlib) + 8
 		} else {
 			est += len(o.Data)/2 + 32
@@ -1005,10 +1029,18 @@ func writePack(objs []*GitObject) []byte {
 			}
 			buf = append(buf, b)
 		}
-		z := o.RawZlib
-		if len(z) == 0 {
-			z = compressZlib(o.Bytes())
-			o.RawZlib = z
+		var z []byte
+		if forceLevel9 {
+			z = compressZlibBest(o.Bytes())
+			if len(o.RawZlib) == 0 || len(z) < len(o.RawZlib) {
+				o.RawZlib = z
+			}
+		} else {
+			z = o.RawZlib
+			if len(z) == 0 {
+				z = compressZlib(o.Bytes())
+				o.RawZlib = z
+			}
 		}
 		buf = append(buf, z...)
 	}

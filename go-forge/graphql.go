@@ -203,7 +203,6 @@ func handleGraphQLRepository(store *ForgeStore, q string, vars map[string]any, v
 		return GraphQLResponse{Data: map[string]any{"repository": nil}}
 	}
 
-	repo.mu.RLock()
 	res := map[string]any{
 		"id":               toGlobalID("Repository", strconv.Itoa(repo.ID)),
 		"databaseId":       repo.ID,
@@ -351,7 +350,6 @@ func handleGraphQLRepository(store *ForgeStore, q string, vars map[string]any, v
 		}
 	}
 
-	repo.mu.RUnlock()
 	return GraphQLResponse{Data: map[string]any{"repository": res}}
 }
 
@@ -414,7 +412,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 		closedNum := 1
 		stClosed := "closed"
 		for _, r := range store.ListRepos("") {
-			r.mu.RLock()
 			matchNum := 0
 			for _, iss := range r.Issues {
 				gid := toGlobalID("Issue", r.Owner+"/"+r.Name+"/"+strconv.Itoa(iss.Number))
@@ -423,7 +420,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 					break
 				}
 			}
-			r.mu.RUnlock()
 			if matchNum > 0 {
 				if updated, _ := r.PatchIssue(matchNum, &stClosed, nil, nil); updated != nil {
 					closedNum = updated.Number
@@ -483,7 +479,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 		}
 		mergedNum := 1
 		for _, r := range store.ListRepos("") {
-			r.mu.RLock()
 			matchNum := 0
 			for _, p := range r.Pulls {
 				if toGlobalID("PullRequest", r.Owner+"/"+r.Name+"/"+strconv.Itoa(p.Number)) == prID {
@@ -491,7 +486,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 					break
 				}
 			}
-			r.mu.RUnlock()
 			if matchNum > 0 {
 				_, _ = r.MergePull(matchNum, false)
 				mergedNum = matchNum
@@ -519,7 +513,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 		body := strVar(input, "body")
 		cid := 1
 		for _, r := range store.ListRepos("") {
-			r.mu.RLock()
 			matchNum := 0
 			for _, iss := range r.Issues {
 				if toGlobalID("Issue", r.Owner+"/"+r.Name+"/"+strconv.Itoa(iss.Number)) == subjectID {
@@ -527,7 +520,6 @@ func handleGraphQLMutation(store *ForgeStore, q string, vars map[string]any) Gra
 					break
 				}
 			}
-			r.mu.RUnlock()
 			if matchNum > 0 {
 				if c, err := r.CreateComment(matchNum, body); err == nil {
 					cid = c.ID

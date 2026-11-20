@@ -50,7 +50,7 @@ func envHTTPRequest(hostPort, hostHdr, method, path string, body []byte) (status
 		return 0, nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Minute))
 
 	var req bytes.Buffer
 	req.Grow(256 + len(body))

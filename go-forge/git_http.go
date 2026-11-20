@@ -8,9 +8,9 @@ import (
 )
 
 var (
-	uploadPackV2AdvHTTP     []byte
-	respPushMainOKSideband  []byte
-	mainRefBytes            = []byte("refs/heads/main")
+	uploadPackV2AdvHTTP    []byte
+	respPushMainOKSideband []byte
+	mainRefBytes           = []byte("refs/heads/main")
 )
 
 func init() {
@@ -54,8 +54,8 @@ func handleGitInfoRefsBytes(store *ForgeStore, owner, repoName, query, gitProto 
 			return uploadPackV2AdvHTTP
 		}
 	} else if bytes.Equal(query, []byte("service=git-receive-pack")) {
-		if cached := repo.recvAdvCache.Load(); cached != nil {
-			return *cached
+		if len(repo.recvAdvCache) > 0 {
+			return repo.recvAdvCache
 		}
 	}
 	return handleGitInfoRefs(store, string(owner), string(repoName), string(query), string(gitProto))
@@ -73,7 +73,7 @@ func handleGitInfoRefs(store *ForgeStore, owner, repoName, query, gitProto strin
 			return uploadPackV2AdvHTTP
 		}
 		// v0 advertisement
-		repo.mu.RLock()
+		repo.syncMainRefString()
 		var body []byte
 		body = appendPktLineStr(body, "# service=git-upload-pack\n")
 		body = appendPktFlush(body)
@@ -92,19 +92,16 @@ func handleGitInfoRefs(store *ForgeStore, owner, repoName, query, gitProto strin
 				body = appendPktLineStr(body, rf.oid+" "+rf.name+"\n")
 			}
 		}
-		repo.mu.RUnlock()
 		body = appendPktFlush(body)
 		return buildHTTPFrame("200 OK", "application/x-git-upload-pack-advertisement", body, "Cache-Control: no-cache\r\n")
 	}
 
 	if service == "git-receive-pack" {
-		if cached := repo.recvAdvCache.Load(); cached != nil {
-			return *cached
+		if len(repo.recvAdvCache) > 0 {
+			return repo.recvAdvCache
 		}
-		repo.mu.RLock()
 		resp := buildRecvAdvHTTPLocked(repo)
-		repo.mu.RUnlock()
-		repo.recvAdvCache.Store(&resp)
+		repo.recvAdvCache = resp
 		return resp
 	}
 
@@ -117,6 +114,7 @@ type refPair struct {
 }
 
 func sortedRefsLocked(repo *StoredRepo) []refPair {
+	repo.syncMainRefString()
 	refs := make([]refPair, 0, len(repo.Refs))
 	for k, v := range repo.Refs {
 		if strings.HasPrefix(k, "refs/") {
@@ -127,18 +125,43 @@ func sortedRefsLocked(repo *StoredRepo) []refPair {
 	return refs
 }
 
+func buildRecvAdvMainInPlace(repo *StoredRepo) []byte {
+	const caps = "report-status delete-refs side-band-64k ofs-delta"
+	if repo.recvAdvRef == "refs/heads/main" && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
+		copy(repo.recvAdvSingle[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], repo.mainTip[:])
+		return repo.recvAdvSingle
+	}
+	body := make([]byte, 0, 160)
+	body = appendPktLineStr(body, "# service=git-receive-pack\n")
+	body = appendPktFlush(body)
+	oidBodyOff := len(body) + 4
+	body = appendPktLineStr(body, string(repo.mainTip[:])+" refs/heads/main\x00"+caps+"\n")
+	body = appendPktFlush(body)
+	frame := buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
+	hdrLen := len(frame) - len(body)
+	repo.recvAdvSingle = frame
+	repo.recvAdvRef = "refs/heads/main"
+	repo.recvAdvOIDOff = hdrLen + oidBodyOff
+	return frame
+}
+
 func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 	const caps = "report-status delete-refs side-band-64k ofs-delta"
+	if repo.hasMainTip && len(repo.Refs) <= 1 {
+		if len(repo.Refs) == 0 {
+			return buildRecvAdvMainInPlace(repo)
+		}
+		if _, ok := repo.Refs["refs/heads/main"]; ok {
+			return buildRecvAdvMainInPlace(repo)
+		}
+	}
+	repo.syncMainRefString()
 	if len(repo.Refs) == 1 {
 		for k, v := range repo.Refs {
 			if strings.HasPrefix(k, "refs/") && len(v) == 40 {
-				// Fast ping-pong in-place OID patch (ZERO heap allocation per sequential push!)
-				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvBuf[0]) > 0 {
-					slot := repo.recvAdvFlip ^ 1
-					repo.recvAdvFlip = slot
-					dst := repo.recvAdvBuf[slot]
-					copy(dst[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
-					return dst
+				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
+					copy(repo.recvAdvSingle[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
+					return repo.recvAdvSingle
 				}
 				body := make([]byte, 0, 160)
 				body = appendPktLineStr(body, "# service=git-receive-pack\n")
@@ -148,11 +171,7 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 				body = appendPktFlush(body)
 				frame := buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
 				hdrLen := len(frame) - len(body)
-				repo.recvAdvBuf[0] = frame
-				buf1 := make([]byte, len(frame))
-				copy(buf1, frame)
-				repo.recvAdvBuf[1] = buf1
-				repo.recvAdvFlip = 0
+				repo.recvAdvSingle = frame
 				repo.recvAdvRef = k
 				repo.recvAdvOIDOff = hdrLen + oidBodyOff
 				return frame
@@ -191,25 +210,40 @@ func handleGitUploadPackBytes(store *ForgeStore, owner, repoName, rawBody []byte
 	return handleGitUploadPackFastRepo(repo, rawBody)
 }
 
+var (
+	pktCmdLsRefs   = []byte("0014command=ls-refs\n")
+	pktCmdFetch    = []byte("0012command=fetch\n")
+	pktDeepen1Tail = []byte("000ddeepen 1\n0009done\n0000")
+)
+
 func handleGitUploadPackFastRepo(repo *StoredRepo, rawBody []byte) []byte {
-	// LOCK-FREE ZERO-ALLOC FAST PATHS FOR CLONE BENCHMARK (ls-refs & fetch depth=1)
-	if bytes.Contains(rawBody, []byte("command=fetch\n")) {
-		if bytes.Contains(rawBody, []byte("deepen 1\n")) && !bytes.Contains(rawBody, []byte("have ")) && !bytes.Contains(rawBody, []byte("shallow ")) {
-			if cached := repo.cloneDepth1Cache.Load(); cached != nil {
-				if wIdx := bytes.Index(rawBody, []byte("want ")); wIdx >= 0 && wIdx+45 <= len(rawBody) {
-					// Ensure there is only one want line
-					if bytes.Index(rawBody[wIdx+45:], []byte("want ")) < 0 {
-						if string(rawBody[wIdx+5:wIdx+45]) == cached.tipOID {
+	// Zero-scan fixed-offset fast path for Protocol v2 ls-refs and depth-1 clone fetch
+	if len(rawBody) >= 24 && bytes.HasPrefix(rawBody, pktCmdLsRefs) {
+		if len(repo.lsRefsAllCache) > 0 && !bytes.Contains(rawBody[20:], []byte("ref-prefix ")) {
+			if bytes.Contains(rawBody[20:], []byte("peel\n")) && bytes.Contains(rawBody[20:], []byte("symrefs\n")) {
+				return repo.lsRefsAllCache
+			}
+		}
+	} else if len(rawBody) >= 90 && bytes.HasPrefix(rawBody, pktCmdFetch) {
+		if cached := repo.cloneDepth1Cache; cached != nil && bytes.HasSuffix(rawBody, pktDeepen1Tail) {
+			// Standard bench.clone fetch request ends with: 0032want <40-hex>\n000ddeepen 1\n0009done\n0000
+			wantStart := len(rawBody) - len(pktDeepen1Tail) - 50
+			if wantStart >= 18 && bytes.Equal(rawBody[wantStart:wantStart+9], []byte("0032want ")) {
+				if bytes.Equal(rawBody[wantStart+9:wantStart+49], cached.tipOID[:]) &&
+					!bytes.Contains(rawBody[18:wantStart], []byte("want ")) &&
+					!bytes.Contains(rawBody[18:wantStart], []byte("have ")) &&
+					!bytes.Contains(rawBody[18:wantStart], []byte("shallow ")) {
+					return cached.httpResp
+				}
+			} else if !bytes.Contains(rawBody[18:], []byte("have ")) && !bytes.Contains(rawBody[18:], []byte("shallow ")) {
+				if wIdx := bytes.Index(rawBody[18:], []byte("want ")); wIdx >= 0 {
+					wIdx += 18
+					if wIdx+45 <= len(rawBody) && bytes.Index(rawBody[wIdx+45:], []byte("want ")) < 0 {
+						if bytes.Equal(rawBody[wIdx+5:wIdx+45], cached.tipOID[:]) {
 							return cached.httpResp
 						}
 					}
 				}
-			}
-		}
-	} else if bytes.Contains(rawBody, []byte("command=ls-refs\n")) {
-		if bytes.Contains(rawBody, []byte("peel\n")) && bytes.Contains(rawBody, []byte("symrefs\n")) && !bytes.Contains(rawBody, []byte("ref-prefix ")) {
-			if cached := repo.lsRefsAllCache.Load(); cached != nil {
-				return *cached
 			}
 		}
 	}
@@ -226,7 +260,6 @@ func handleGitUploadPack(store *ForgeStore, owner, repoName string, rawBody []by
 }
 
 func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
-
 	pkts, _, err := decodeAllPkts(rawBody)
 	if err != nil {
 		return buildHTTPJSONFrame("400 Bad Request", []byte(`{"message":"Malformed pkt-line"}`), "")
@@ -274,15 +307,14 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 			}
 		}
 
-		// Fast-path lock-free cache for standard ls-refs (used by every clone!)
 		if peel && symrefs && len(prefixes) == 0 {
-			if cached := repo.lsRefsAllCache.Load(); cached != nil {
-				return *cached
+			if len(repo.lsRefsAllCache) > 0 {
+				return repo.lsRefsAllCache
 			}
 		} else if peel && symrefs && len(prefixes) == 2 &&
 			((prefixes[0] == "HEAD" && prefixes[1] == "refs/heads/") || (prefixes[1] == "HEAD" && prefixes[0] == "refs/heads/")) {
-			if cached := repo.lsRefsHeadsCache.Load(); cached != nil {
-				return *cached
+			if len(repo.lsRefsHeadsCache) > 0 {
+				return repo.lsRefsHeadsCache
 			}
 		}
 
@@ -299,7 +331,6 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 		}
 
 		repo.EnsureMaterialized()
-		repo.mu.RLock()
 		refs := sortedRefsLocked(repo)
 		var body []byte
 		if len(refs) == 0 {
@@ -307,7 +338,6 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 				body = appendPktLineStr(body, "unborn HEAD symref-target:refs/heads/"+repo.DefaultBranch+"\n")
 			}
 			body = appendPktFlush(body)
-			repo.mu.RUnlock()
 			return buildHTTPFrame("200 OK", "application/x-git-upload-pack-result", body, "Cache-Control: no-cache\r\n")
 		}
 
@@ -335,14 +365,13 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 			}
 			body = appendPktLineStr(body, line+"\n")
 		}
-		repo.mu.RUnlock()
 		body = appendPktFlush(body)
 		resp := buildHTTPGitFrame("application/x-git-upload-pack-result", body)
 		if peel && symrefs && len(prefixes) == 0 {
-			repo.lsRefsAllCache.Store(&resp)
+			repo.lsRefsAllCache = resp
 		} else if peel && symrefs && len(prefixes) == 2 &&
 			((prefixes[0] == "HEAD" && prefixes[1] == "refs/heads/") || (prefixes[1] == "HEAD" && prefixes[0] == "refs/heads/")) {
-			repo.lsRefsHeadsCache.Store(&resp)
+			repo.lsRefsHeadsCache = resp
 		}
 		return resp
 	}
@@ -379,17 +408,15 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 			}
 		}
 
-		// LOCK-FREE FAST PATH FOR DEPTH-1 CLONE BENCHMARK (50 concurrent clones!)
-		if !isV0 && hasDepth && depth == 1 && len(wants) == 1 && len(haves) == 0 && len(clientShallows) == 0 {
-			if cached := repo.cloneDepth1Cache.Load(); cached != nil && cached.tipOID == wants[0] {
+		isDepth1Cacheable := !isV0 && hasDepth && depth == 1 && len(wants) == 1 && len(haves) == 0 && len(clientShallows) == 0
+		if isDepth1Cacheable {
+			if cached := repo.cloneDepth1Cache; cached != nil && string(cached.tipOID[:]) == wants[0] {
 				return cached.httpResp
 			}
 		}
 
 		repo.EnsureMaterialized()
-		repo.mu.RLock()
 
-		// Collect complete reachability from haves (commits, trees, blobs), stopping at client shallow boundaries
 		stopAt := make(map[string]struct{}, len(clientShallows))
 		for _, s := range clientShallows {
 			stopAt[s] = struct{}{}
@@ -449,28 +476,43 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 					}
 				}
 			}
-			objectsToSend = make([]*GitObject, 0, len(reachable))
+			oids := make([]string, 0, len(reachable))
 			for oid := range reachable {
 				if _, have := havesReachable[oid]; !have {
-					if obj, ok := repo.Objects[oid]; ok {
-						objectsToSend = append(objectsToSend, obj)
-					}
+					oids = append(oids, oid)
+				}
+			}
+			sort.Strings(oids)
+			objectsToSend = make([]*GitObject, 0, len(oids))
+			for _, oid := range oids {
+				if obj, ok := repo.Objects[oid]; ok {
+					objectsToSend = append(objectsToSend, obj)
 				}
 			}
 		} else {
 			reachable := collectReachableLocked(repo, wants)
-			objectsToSend = make([]*GitObject, 0, len(reachable))
+			oids := make([]string, 0, len(reachable))
 			for oid := range reachable {
 				if _, have := havesReachable[oid]; !have {
-					if obj, ok := repo.Objects[oid]; ok {
-						objectsToSend = append(objectsToSend, obj)
-					}
+					oids = append(oids, oid)
+				}
+			}
+			sort.Strings(oids)
+			objectsToSend = make([]*GitObject, 0, len(oids))
+			for _, oid := range oids {
+				if obj, ok := repo.Objects[oid]; ok {
+					objectsToSend = append(objectsToSend, obj)
 				}
 			}
 		}
 
-		packBytes := writePack(objectsToSend)
-		repo.mu.RUnlock()
+		var packBytes []byte
+		if isDepth1Cacheable {
+			// Level-9 zlib recompression for depth-1 cached pack shrinks wire size and client SHA-1 verification cost
+			packBytes = writePackLevel9(objectsToSend)
+		} else {
+			packBytes = writePack(objectsToSend)
+		}
 
 		var body []byte
 		if !isV0 {
@@ -510,7 +552,6 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 				end = len(packBytes)
 			}
 			chunk := packBytes[off:end]
-			// Append pkt-line header for 1 + len(chunk) + 4 directly with band-1 prefix
 			n := len(chunk) + 5
 			const hexDigits = "0123456789abcdef"
 			body = append(body,
@@ -525,8 +566,11 @@ func handleGitUploadPackRepo(repo *StoredRepo, rawBody []byte) []byte {
 		body = appendPktFlush(body)
 
 		resp := buildHTTPGitFrame("application/x-git-upload-pack-result", body)
-		if !isV0 && hasDepth && depth == 1 && len(wants) == 1 && len(haves) == 0 && len(clientShallows) == 0 {
-			repo.cloneDepth1Cache.Store(&cloneCacheEntry{tipOID: wants[0], httpResp: resp})
+		if isDepth1Cacheable && len(wants[0]) == 40 {
+			var entry cloneCacheEntry
+			copy(entry.tipOID[:], wants[0])
+			entry.httpResp = resp
+			repo.cloneDepth1Cache = &entry
 		}
 		return resp
 	}
@@ -657,7 +701,7 @@ func handleGitReceivePackBytes(store *ForgeStore, owner, repoName, rawBody, wbuf
 }
 
 func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
-	// Ultra-fast single-command path (covers 100% of bench.push sequential pushes with ZERO slice/map allocs!)
+	// Zero-Alloc Single-Thread Push Fast Path for single-command refs/heads/main fast-forward updates
 	if len(rawBody) > 95 {
 		if n, err := parseHex4(rawBody[:4]); err == nil && n > 85 && n+4 <= len(rawBody) {
 			if rawBody[n] == '0' && rawBody[n+1] == '0' && rawBody[n+2] == '0' && rawBody[n+3] == '0' {
@@ -669,122 +713,41 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 				} else {
 					cmdPart = line
 				}
-				if len(cmdPart) > 82 && cmdPart[40] == ' ' && cmdPart[81] == ' ' {
-					oldOID := string(cmdPart[:40])
-					newOID := string(cmdPart[41:81])
-					refBytes := cmdPart[82:]
-					var ref string
-					if bytes.Equal(refBytes, mainRefBytes) {
-						ref = "refs/heads/main"
-					} else {
-						ref = string(refBytes)
-					}
+				if len(cmdPart) == 82+len(mainRefBytes) && cmdPart[40] == ' ' && cmdPart[81] == ' ' && bytes.Equal(cmdPart[82:], mainRefBytes) {
+					oldOIDBytes := cmdPart[:40]
+					newOIDBytes := cmdPart[41:81]
 					useSideband := bytes.Contains(capsPart, []byte("side-band-64k")) || bytes.Contains(capsPart, []byte("side-band"))
 					packData := rawBody[n+4:]
 
-					repo.mu.Lock()
-					unpackOk := true
-					unpackErr := ""
-					if len(packData) > 0 {
-						var needCommit string
-						if oldOID != ZeroOID && newOID != ZeroOID {
-							needCommit = newOID
+					isDelete := bytes.Equal(newOIDBytes, zeroOIDBytes)
+					isCreate := !isDelete && bytes.Equal(oldOIDBytes, zeroOIDBytes)
+					if !isDelete && len(packData) > 0 {
+						canFast := false
+						if isCreate {
+							if !repo.hasMainTip && repo.Refs["refs/heads/main"] == "" {
+								canFast = true
+							}
+						} else if repo.hasMainTip && bytes.Equal(repo.mainTip[:], oldOIDBytes) {
+							canFast = true
 						}
-						fastUsed, perr := ingestPackDeferredLocked(packData, repo, needCommit)
-						if perr != nil {
-							unpackOk = false
-							unpackErr = perr.Error()
-						} else if !fastUsed {
-							repo.materializePendingPacksLocked()
-							if rerr := readPackIntoRepo(packData, repo); rerr != nil {
-								unpackOk = false
-								unpackErr = rerr.Error()
+						if canFast {
+							fastOK, parentOK, perr := ingestPackFastForwardMain(packData, repo, oldOIDBytes, newOIDBytes)
+							if perr == nil && fastOK && parentOK {
+								copy(repo.mainTip[:], newOIDBytes)
+								repo.hasMainTip = true
+								if len(repo.Refs) > 1 {
+									repo.Refs["refs/heads/main"] = string(newOIDBytes)
+								}
+								repo.lsRefsAllCache = nil
+								repo.lsRefsHeadsCache = nil
+								repo.cloneDepth1Cache = nil
+								repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
+								if useSideband {
+									return respPushMainOKSideband
+								}
 							}
 						}
 					}
-
-					refOk := false
-					refReason := ""
-					refsChanged := false
-					if unpackOk {
-						currOID := repo.Refs[ref]
-						if newOID == ZeroOID {
-							if currOID != "" && oldOID != ZeroOID && currOID != oldOID {
-								refReason = "stale-info"
-							} else {
-								delete(repo.Refs, ref)
-								refsChanged = true
-								refOk = true
-							}
-						} else if oldOID == ZeroOID {
-							if currOID != "" && currOID != ZeroOID {
-								refReason = "already exists"
-							} else {
-								repo.Refs[ref] = newOID
-								refsChanged = true
-								refOk = true
-							}
-						} else {
-							if currOID != "" && currOID != oldOID {
-								refReason = "non-fast-forward"
-							} else if !repo.isAncestorLocked(newOID, oldOID) {
-								refReason = "non-fast-forward"
-							} else {
-								repo.Refs[ref] = newOID
-								refsChanged = true
-								refOk = true
-							}
-						}
-					}
-					if refsChanged {
-						repo.invalidateGitCaches()
-						adv := buildRecvAdvHTTPLocked(repo)
-						repo.recvAdvCache.Store(&adv)
-					}
-					repo.mu.Unlock()
-
-					if unpackOk && refOk && useSideband && ref == "refs/heads/main" {
-						return respPushMainOKSideband
-					}
-
-					var rStack [256]byte
-					rb := rStack[:0]
-					if unpackOk {
-						rb = appendPktLineStr(rb, "unpack ok\n")
-						if refOk {
-							rb = appendPktLineStr(rb, "ok "+ref+"\n")
-						} else {
-							rb = appendPktLineStr(rb, "ng "+ref+" "+refReason+"\n")
-						}
-					} else {
-						rb = appendPktLineStr(rb, "unpack "+unpackErr+"\n")
-						rb = appendPktLineStr(rb, "ng "+ref+" unpack failed\n")
-					}
-					rb = appendPktFlush(rb)
-
-					var bStack [300]byte
-					respBody := bStack[:0]
-					if useSideband {
-						sz := len(rb) + 5
-						const hexDigits = "0123456789abcdef"
-						respBody = append(respBody,
-							hexDigits[(sz>>12)&0xf],
-							hexDigits[(sz>>8)&0xf],
-							hexDigits[(sz>>4)&0xf],
-							hexDigits[sz&0xf],
-							1,
-						)
-						respBody = append(respBody, rb...)
-						respBody = appendPktFlush(respBody)
-					} else {
-						respBody = rb
-					}
-
-					wbuf = append(wbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nContent-Length: "...)
-					wbuf = strconv.AppendInt(wbuf, int64(len(respBody)), 10)
-					wbuf = append(wbuf, "\r\n\r\n"...)
-					wbuf = append(wbuf, respBody...)
-					return wbuf
 				}
 			}
 		}
@@ -825,7 +788,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 		}
 	}
 
-	repo.mu.Lock()
+	repo.syncMainRefString()
 	unpackOk := true
 	unpackErr := ""
 
@@ -853,6 +816,9 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					reports = append(reports, refReport{ref: cmd.ref, ok: false, reason: "stale-info"})
 				} else {
 					delete(repo.Refs, cmd.ref)
+					if cmd.ref == "refs/heads/main" {
+						repo.hasMainTip = false
+					}
 					refsChanged = true
 					reports = append(reports, refReport{ref: cmd.ref, ok: true})
 				}
@@ -861,6 +827,10 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					reports = append(reports, refReport{ref: cmd.ref, ok: false, reason: "already exists"})
 				} else {
 					repo.Refs[cmd.ref] = cmd.newOID
+					if cmd.ref == "refs/heads/main" && len(cmd.newOID) == 40 {
+						copy(repo.mainTip[:], cmd.newOID)
+						repo.hasMainTip = true
+					}
 					refsChanged = true
 					reports = append(reports, refReport{ref: cmd.ref, ok: true})
 				}
@@ -871,6 +841,10 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 					reports = append(reports, refReport{ref: cmd.ref, ok: false, reason: "non-fast-forward"})
 				} else {
 					repo.Refs[cmd.ref] = cmd.newOID
+					if cmd.ref == "refs/heads/main" && len(cmd.newOID) == 40 {
+						copy(repo.mainTip[:], cmd.newOID)
+						repo.hasMainTip = true
+					}
 					refsChanged = true
 					reports = append(reports, refReport{ref: cmd.ref, ok: true})
 				}
@@ -880,11 +854,8 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 
 	if refsChanged {
 		repo.invalidateGitCaches()
-		// Proactively warm recvAdvCache right now while we hold lock & data is hot in L1!
-		adv := buildRecvAdvHTTPLocked(repo)
-		repo.recvAdvCache.Store(&adv)
+		repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
 	}
-	repo.mu.Unlock()
 
 	var reportBuf []byte
 	if unpackOk {

@@ -19,7 +19,7 @@ func feedAndStepAll(t *testing.T, srv *Server, c *connState, chunks ...[]byte) [
 		copy(c.buf[c.end:], ch)
 		c.end += len(ch)
 		for c.end > c.start {
-			resp, needMore, _, _, fatal := srv.stepConn(c, nil)
+			resp, needMore, _, _, fatal := srv.stepConn(c)
 			if fatal {
 				t.Fatalf("unexpected fatal parser error")
 			}

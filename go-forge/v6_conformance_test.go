@@ -615,7 +615,7 @@ func TestV6PerFDHotSocketReadAndWriteBenchmarkSimulation(t *testing.T) {
 		bodyStr := `{"title":"Issue title [bench ` + string(rune('0'+(i%10))) + `]","body":"v6 benchmark issue body"}`
 		hdrStr := "POST /api/v3/repos/adaiversen/bench-rw-v6/issues HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-secret\r\nContent-Length: 66\r\n\r\n" + bodyStr
 		out := feedAndStepAll(t, srv, conn, []byte(hdrStr))
-		if len(out) != 1 || !bytes.Contains(out[0], []byte("HTTP/1.1 201 Created")) || !bytes.Contains(out[0], []byte(`{"number":`)) {
+		if len(out) != 1 || !bytes.Contains(out[0], []byte("HTTP/1.1 201 Created")) || !bytes.Contains(out[0], []byte(`"number":`)) {
 			t.Fatalf("v6 sequential POST issue %d failed: %s", i, string(bytes.Join(out, nil)))
 		}
 	}
@@ -634,7 +634,7 @@ func TestV6PerFDHotSocketReadAndWriteBenchmarkSimulation(t *testing.T) {
 	getIssue51 := []byte("GET /api/v3/repos/adaiversen/bench-rw-v6/issues/51 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-secret\r\n\r\n")
 	for i := 1; i <= 100; i++ {
 		outGet := feedAndStepAll(t, srv, conn, getIssue51)
-		if len(outGet) != 1 || !bytes.Contains(outGet[0], []byte(`{"number":51}`)) {
+		if len(outGet) != 1 || !bytes.Contains(outGet[0], []byte(`"number":51`)) {
 			t.Fatalf("v6 sequential GET issue 51 iteration %d failed: %s", i, string(bytes.Join(outGet, nil)))
 		}
 	}
@@ -892,7 +892,7 @@ func TestV6RestNestedDirectoriesDeleteAndIssueSorting(t *testing.T) {
 	conn.prepareReadWindow()
 	copy(conn.buf[conn.end:], closeReq)
 	conn.end += len(closeReq)
-	resp, needMore, _, closeAfter, fatal := srv.stepConn(conn, nil)
+	resp, needMore, _, closeAfter, fatal := srv.stepConn(conn)
 	if fatal || needMore || !closeAfter || !bytes.Contains(resp, []byte("404 Not Found")) {
 		t.Fatalf("v6 Connection: close or 404 handling failed: closeAfter=%v resp=%s", closeAfter, string(resp))
 	}

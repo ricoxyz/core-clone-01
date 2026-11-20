@@ -56,10 +56,23 @@ type connState struct {
 	lastGetStoreGen uint64
 
 	// Per-FD Hot-Socket POST issue cache (accelerates 200 sequential POSTs on one keep-alive socket)
-	lastPostPath [128]byte
-	lastPostLen  int
-	lastPostRepo *StoredRepo
+	lastPostPath     [128]byte
+	lastPostLen      int
+	lastPostRepo     *StoredRepo
 	lastPostStoreGen uint64
+
+	// Per-FD Hot-Socket GET info/refs?service=git-receive-pack cache (accelerates 200 sequential pushes)
+	lastInfoRefsRaw      [256]byte
+	lastInfoRefsLen      int
+	lastInfoRefsRepo     *StoredRepo
+	lastInfoRefsStoreGen uint64
+
+	// Per-FD Hot-Socket POST git-upload-pack / git-receive-pack repo cache
+	lastGitPostPath     [128]byte
+	lastGitPostLen      int
+	lastGitPostRepo     *StoredRepo
+	lastGitPostIsUpload bool
+	lastGitPostStoreGen uint64
 }
 
 func newConnState() *connState {
@@ -89,6 +102,10 @@ func (c *connState) resetForPool() {
 	c.lastGetRepo = nil
 	c.lastPostLen = 0
 	c.lastPostRepo = nil
+	c.lastInfoRefsLen = 0
+	c.lastInfoRefsRepo = nil
+	c.lastGitPostLen = 0
+	c.lastGitPostRepo = nil
 }
 
 func (c *connState) prepareReadWindow() {
@@ -210,7 +227,7 @@ func findContentLengthSIMD(hdr []byte) (int, bool) {
 // If the full request (headers + full body) is not yet in c.buf, it returns needMore=true without advancing c.start.
 // When headers of a POST request arrived without the complete body, it returns needQuickAck=true so the Linux
 // epoll reactor re-arms TCP_QUICKACK on the raw socket fd immediately.
-func (s *Server) stepConn(c *connState, _ func()) (resp []byte, needMore bool, needQuickAck bool, closeAfter bool, fatal bool) {
+func (s *Server) stepConn(c *connState) (resp []byte, needMore bool, needQuickAck bool, closeAfter bool, fatal bool) {
 	buf := c.buf
 	start := c.start
 	end := c.end
@@ -222,15 +239,29 @@ func (s *Server) stepConn(c *connState, _ func()) (resp []byte, needMore bool, n
 	// =========================================================================
 	// PER-FD ULTRA-HOT-SOCKET CACHE HIT: Identical sequential GET on keep-alive
 	// =========================================================================
-	if c.lastGetLen > 0 && avail >= c.lastGetLen && buf[start] == 'G' {
-		if r := c.lastGetRepo; r != nil && r.issueGen == c.lastGetGen && s.store.mutationGen == c.lastGetStoreGen {
-			if bytes.Equal(buf[start:start+c.lastGetLen], c.lastGetRaw[:c.lastGetLen]) {
-				c.start += c.lastGetLen
-				if c.start == c.end {
-					c.start = 0
-					c.end = 0
+	if buf[start] == 'G' {
+		if c.lastGetLen > 0 && avail >= c.lastGetLen {
+			if r := c.lastGetRepo; r != nil && r.issueGen == c.lastGetGen && s.store.mutationGen == c.lastGetStoreGen {
+				if bytes.Equal(buf[start:start+c.lastGetLen], c.lastGetRaw[:c.lastGetLen]) {
+					c.start += c.lastGetLen
+					if c.start == c.end {
+						c.start = 0
+						c.end = 0
+					}
+					return c.lastGetResp, false, false, false, false
 				}
-				return c.lastGetResp, false, false, false, false
+			}
+		}
+		if c.lastInfoRefsLen > 0 && avail >= c.lastInfoRefsLen {
+			if r := c.lastInfoRefsRepo; r != nil && s.store.mutationGen == c.lastInfoRefsStoreGen && len(r.recvAdvCache) > 0 {
+				if bytes.Equal(buf[start:start+c.lastInfoRefsLen], c.lastInfoRefsRaw[:c.lastInfoRefsLen]) {
+					c.start += c.lastInfoRefsLen
+					if c.start == c.end {
+						c.start = 0
+						c.end = 0
+					}
+					return r.recvAdvCache, false, false, false, false
+				}
 			}
 		}
 	}
@@ -308,17 +339,26 @@ func (s *Server) stepConn(c *connState, _ func()) (resp []byte, needMore bool, n
 					if sp := bytes.IndexByte(svcPart, ' '); sp > 0 {
 						svc := svcPart[:sp]
 						repo := s.store.GetRepoBytes(ownerRepo[:slash], ownerRepo[slash+1:])
+						isRecv := false
 						if repo == nil {
 							resp = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Repository not found"}`), "")
 						} else if bytes.Equal(svc, []byte("git-upload-pack")) && bytes.Contains(headerBlock, []byte("version=2")) {
 							resp = uploadPackV2AdvHTTP
 						} else if bytes.Equal(svc, []byte("git-receive-pack")) {
-							if len(repo.recvAdvCache) > 0 {
-								resp = repo.recvAdvCache
+							isRecv = true
+							if len(repo.recvAdvCache) == 0 {
+								repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
 							}
+							resp = repo.recvAdvCache
 						}
 						if resp != nil {
 							closeAfter = containsConnCloseSIMD(headerBlock)
+							if isRecv && !closeAfter && reqHeaderTotal <= len(c.lastInfoRefsRaw) {
+								copy(c.lastInfoRefsRaw[:reqHeaderTotal], buf[start:bodyStart])
+								c.lastInfoRefsLen = reqHeaderTotal
+								c.lastInfoRefsRepo = repo
+								c.lastInfoRefsStoreGen = s.store.mutationGen
+							}
 							c.start = bodyStart
 							if c.start == c.end {
 								c.start = 0
@@ -432,7 +472,19 @@ func (s *Server) stepConn(c *connState, _ func()) (resp []byte, needMore bool, n
 									return nil, true, true, false, false
 								}
 								closeAfter = containsConnCloseSIMD(headerBlock)
-								repo := s.store.GetRepoBytes(ownerRepo[:slash], ownerRepo[slash+1:])
+								var repo *StoredRepo
+								if c.lastGitPostRepo != nil && c.lastGitPostStoreGen == s.store.mutationGen && c.lastGitPostIsUpload == isUpload && c.lastGitPostLen == len(ownerRepo) && bytes.Equal(c.lastGitPostPath[:c.lastGitPostLen], ownerRepo) {
+									repo = c.lastGitPostRepo
+								} else {
+									repo = s.store.GetRepoBytes(ownerRepo[:slash], ownerRepo[slash+1:])
+									if repo != nil && len(ownerRepo) <= len(c.lastGitPostPath) {
+										copy(c.lastGitPostPath[:len(ownerRepo)], ownerRepo)
+										c.lastGitPostLen = len(ownerRepo)
+										c.lastGitPostRepo = repo
+										c.lastGitPostIsUpload = isUpload
+										c.lastGitPostStoreGen = s.store.mutationGen
+									}
+								}
 								reqBody := c.buf[bodyStart:needEnd]
 								if repo == nil {
 									resp = buildHTTPJSONFrame("404 Not Found", []byte(`{"message":"Repository not found"}`), "")
@@ -1145,6 +1197,7 @@ func (s *Server) handleRest(method, subpath, query, host string, rawBody []byte,
 					copy(repo.mainTip[:], body.SHA)
 					repo.hasMainTip = true
 				}
+				repo.recomputeOnlyMainRef()
 				repo.invalidateGitCaches()
 				return jsonFrame("201 Created", map[string]any{
 					"ref":     body.Ref,

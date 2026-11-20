@@ -98,11 +98,19 @@ func envHTTPRequest(hostPort, hostHdr, method, path string, body []byte) (status
 	return code, respBody, nil
 }
 
+func resolveEnvDialTarget(hostPort string) string {
+	if tcpAddr, err := net.ResolveTCPAddr("tcp", hostPort); err == nil && tcpAddr != nil {
+		return tcpAddr.String()
+	}
+	return hostPort
+}
+
 func registerWithEnv(envURL string, port int) error {
 	hostPort, hostHdr, basePath := parseEnvBase(envURL)
+	dialTarget := resolveEnvDialTarget(hostPort)
 	payload := []byte(fmt.Sprintf(`{"port":%d}`, port))
 	for attempt := 0; ; attempt++ {
-		code, body, err := envHTTPRequest(hostPort, hostHdr, "POST", basePath+"/register", payload)
+		code, body, err := envHTTPRequest(dialTarget, hostHdr, "POST", basePath+"/register", payload)
 		if err == nil {
 			if code == 200 || code == 409 {
 				return nil
@@ -117,8 +125,9 @@ func registerWithEnv(envURL string, port int) error {
 
 func waitForEnvDone(envURL string) {
 	hostPort, hostHdr, basePath := parseEnvBase(envURL)
+	dialTarget := resolveEnvDialTarget(hostPort)
 	for attempt := 0; ; attempt++ {
-		code, body, err := envHTTPRequest(hostPort, hostHdr, "GET", basePath+"/done", nil)
+		code, body, err := envHTTPRequest(dialTarget, hostHdr, "GET", basePath+"/done", nil)
 		if err == nil && code >= 200 && code < 300 {
 			if bytes.Contains(body, []byte(`"done":true`)) || bytes.Contains(body, []byte(`"done": true`)) {
 				return

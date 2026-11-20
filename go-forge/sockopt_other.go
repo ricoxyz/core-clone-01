@@ -38,7 +38,7 @@ func (s *Server) Serve() {
 					var toWrite [][]byte
 					var closeConnNow bool
 					for c.end > c.start {
-						resp, needMore, _, closeAfter, fatal := s.stepConn(c, nil)
+						resp, needMore, _, closeAfter, fatal := s.stepConn(c)
 						if fatal {
 							closeConnNow = true
 							break

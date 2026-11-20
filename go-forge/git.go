@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
@@ -86,10 +87,12 @@ type ParsedTag struct {
 	Tag    string
 }
 
-// Single-threaded persistent zlib readers/writers (no sync.Pool overhead on reactor hot path)
+// Single-threaded persistent zlib/flate readers/writers (no sync.Pool overhead on reactor hot path)
 var (
 	reactorZlibBr      bytes.Reader
 	reactorZlibZr      io.ReadCloser
+	reactorFlateBr     bytes.Reader
+	reactorFlateFr     io.ReadCloser
 	reactorSha1        hash.Hash = sha1.New()
 	reactorScratch     [2080]byte
 	reactorZlibWFast   *zlib.Writer
@@ -153,6 +156,54 @@ func decompressZlibInto(src []byte, expectedSize int, dst []byte) ([]byte, int, 
 
 func decompressZlib(src []byte, expectedSize int) ([]byte, int, error) {
 	return decompressZlibInto(src, expectedSize, nil)
+}
+
+// decompressRawFlateInto inflates a zlib-wrapped deflate payload using a persistent raw
+// compress/flate reader (skipping Adler-32 because the packfile trailer SHA-1 is already verified).
+func decompressRawFlateInto(src []byte, expectedSize int, dst []byte) ([]byte, error) {
+	if len(src) < 3 {
+		return nil, errors.New("zlib stream too short")
+	}
+	cmf, flg := src[0], src[1]
+	if cmf&0x0f != 8 || flg&0x20 != 0 || ((int(cmf)<<8)|int(flg))%31 != 0 {
+		return nil, errors.New("invalid zlib header")
+	}
+	reactorFlateBr.Reset(src[2:])
+	if reactorFlateFr == nil {
+		reactorFlateFr = flate.NewReader(&reactorFlateBr)
+	} else if resetter, ok := reactorFlateFr.(flate.Resetter); ok {
+		if err := resetter.Reset(&reactorFlateBr, nil); err != nil {
+			return nil, err
+		}
+	} else {
+		reactorFlateFr = flate.NewReader(&reactorFlateBr)
+	}
+
+	out := dst
+	if len(out) < expectedSize {
+		out = make([]byte, expectedSize)
+	} else {
+		out = out[:expectedSize]
+	}
+	if expectedSize > 0 {
+		if _, err := io.ReadFull(reactorFlateFr, out); err != nil {
+			return nil, err
+		}
+	}
+	var trail [8]byte
+	for {
+		n, err := reactorFlateFr.Read(trail[:])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			out = append(out, trail[:n]...)
+		}
+	}
+	return out, nil
 }
 
 // decompressAndHashBlob streams zlib output straight into SHA-1 without allocating a blob Data buffer!
@@ -264,6 +315,30 @@ func hashObjectBytes(t GitObjType, data []byte, outHex *[40]byte) {
 		b := hdr[:0]
 		b = append(b, t.String()...)
 		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, 0)
+		reactorSha1.Write(b)
+		reactorSha1.Write(data)
+		reactorSha1.Sum(sum[:0])
+	}
+	hex.Encode(outHex[:], sum[:])
+}
+
+func hashCommitBytes(data []byte, outHex *[40]byte) {
+	var sum [20]byte
+	if len(data) <= 2000 {
+		var stack [2048]byte
+		b := stack[:0]
+		b = append(b, "commit "...)
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, 0)
+		b = append(b, data...)
+		sum = sha1.Sum(b)
+	} else {
+		reactorSha1.Reset()
+		var hdr [32]byte
+		b := hdr[:0]
+		b = append(b, "commit "...)
 		b = strconv.AppendInt(b, int64(len(data)), 10)
 		b = append(b, 0)
 		reactorSha1.Write(b)
@@ -720,59 +795,79 @@ func ingestPackFastForwardMain(pack []byte, repo *StoredRepo, oldOID40, newOID40
 		return true, true, nil
 	}
 
-	// Scan backwards from the end of the pack body for a plain ObjCommit zlib stream matching newOID40
+	// Scan the tail 1 KiB of the pack body first (where commits typically reside),
+	// falling back to the remaining prefix if not found in the tail.
 	var scratch [2048]byte
 	var calcHex [40]byte
-	for i := len(body) - 6; i >= 13; i-- {
-		if body[i] != 0x78 {
-			continue
-		}
-		b1 := body[i+1]
-		if b1 != 0x9c && b1 != 0x01 && b1 != 0x5e && b1 != 0xda {
-			continue
-		}
-		size := -1
-		if i >= 14 {
-			h0, h1 := body[i-2], body[i-1]
-			if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 == 0 {
-				s := int(h0&0x0f) | (int(h1&0x7f) << 4)
-				if s >= 48 && s <= 2000 {
-					size = s
+	scanRange := func(hi, lo int) (fastOK, parentMatched, decided bool) {
+		for i := hi; i >= lo; i-- {
+			if body[i] != 0x78 {
+				continue
+			}
+			b1 := body[i+1]
+			if b1 != 0x9c && b1 != 0x01 && b1 != 0x5e && b1 != 0xda {
+				continue
+			}
+			size := -1
+			if i >= 14 {
+				h0, h1 := body[i-2], body[i-1]
+				if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 == 0 {
+					s := int(h0&0x0f) | (int(h1&0x7f) << 4)
+					if s >= 48 && s <= 2000 {
+						size = s
+					}
 				}
 			}
-		}
-		if size < 0 && i >= 15 {
-			h0, h1, h2 := body[i-3], body[i-2], body[i-1]
-			if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 != 0 && h2&0x80 == 0 {
-				s := int(h0&0x0f) | (int(h1&0x7f) << 4) | (int(h2&0x7f) << 11)
-				if s >= 2000 && s <= 65536 {
-					size = s
+			if size < 0 && i >= 15 {
+				h0, h1, h2 := body[i-3], body[i-2], body[i-1]
+				if h0&0x80 != 0 && GitObjType((h0>>4)&7) == ObjCommit && h1&0x80 != 0 && h2&0x80 == 0 {
+					s := int(h0&0x0f) | (int(h1&0x7f) << 4) | (int(h2&0x7f) << 11)
+					if s >= 2000 && s <= 65536 {
+						size = s
+					}
 				}
 			}
-		}
-		if size < 0 {
-			continue
-		}
-		var dst []byte
-		if size <= len(scratch) {
-			dst = scratch[:size]
-		}
-		raw, _, derr := decompressZlibInto(body[i:], size, dst)
-		if derr != nil || len(raw) != size {
-			continue
-		}
-		hashObjectBytes(ObjCommit, raw, &calcHex)
-		if bytes.Equal(calcHex[:], newOID40) {
-			fp := fastFirstParentBytes(raw)
-			if len(fp) == 40 && bytes.Equal(fp, oldOID40) {
-				packCopy := repo.allocArenaLocked(len(pack))
-				copy(packCopy, pack)
-				repo.pendingPacks = append(repo.pendingPacks, packCopy)
-				repo.hasPendingPacks = true
-				return true, true, nil
+			if size < 0 {
+				continue
 			}
-			// Found the new commit, but its first parent is not oldOID40 (could be multi-step or non-FF)
-			return false, false, nil
+			var dst []byte
+			if size <= len(scratch) {
+				dst = scratch[:size]
+			}
+			raw, derr := decompressRawFlateInto(body[i:], size, dst)
+			if derr != nil || len(raw) != size {
+				continue
+			}
+			hashCommitBytes(raw, &calcHex)
+			if bytes.Equal(calcHex[:], newOID40) {
+				fp := fastFirstParentBytes(raw)
+				if len(fp) == 40 && bytes.Equal(fp, oldOID40) {
+					packCopy := repo.allocArenaLocked(len(pack))
+					copy(packCopy, pack)
+					repo.pendingPacks = append(repo.pendingPacks, packCopy)
+					repo.hasPendingPacks = true
+					return true, true, true
+				}
+				// Found the new commit, but its first parent is not oldOID40 (could be multi-step or non-FF)
+				return false, false, true
+			}
+		}
+		return false, false, false
+	}
+
+	hi := len(body) - 6
+	if hi >= 13 {
+		tailLo := len(body) - 1024
+		if tailLo < 13 {
+			tailLo = 13
+		}
+		if fastOK, parentMatched, decided := scanRange(hi, tailLo); decided {
+			return fastOK, parentMatched, nil
+		}
+		if tailLo > 13 {
+			if fastOK, parentMatched, decided := scanRange(tailLo-1, 13); decided {
+				return fastOK, parentMatched, nil
+			}
 		}
 	}
 	return false, false, nil

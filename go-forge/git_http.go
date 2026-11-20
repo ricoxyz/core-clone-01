@@ -214,35 +214,88 @@ var (
 	pktCmdLsRefs   = []byte("0014command=ls-refs\n")
 	pktCmdFetch    = []byte("0012command=fetch\n")
 	pktDeepen1Tail = []byte("000ddeepen 1\n0009done\n0000")
+	pktWantPrefix  = []byte("0032want ")
 )
 
 func handleGitUploadPackFastRepo(repo *StoredRepo, rawBody []byte) []byte {
-	// Zero-scan fixed-offset fast path for Protocol v2 ls-refs and depth-1 clone fetch
+	// Zero-scan fixed-offset / single-pass pkt-line fast path for Protocol v2 ls-refs and depth-1 clone fetch
 	if len(rawBody) >= 24 && bytes.HasPrefix(rawBody, pktCmdLsRefs) {
-		if len(repo.lsRefsAllCache) > 0 && !bytes.Contains(rawBody[20:], []byte("ref-prefix ")) {
-			if bytes.Contains(rawBody[20:], []byte("peel\n")) && bytes.Contains(rawBody[20:], []byte("symrefs\n")) {
+		if len(repo.lsRefsAllCache) > 0 {
+			pos := 20
+			hasPeel := false
+			hasSymrefs := false
+			ok := true
+			seenFlush := false
+			for pos+4 <= len(rawBody) {
+				n, err := parseHex4(rawBody[pos : pos+4])
+				if err != nil {
+					ok = false
+					break
+				}
+				pos += 4
+				if n == 0 {
+					seenFlush = pos == len(rawBody)
+					break
+				}
+				if n == 1 {
+					continue
+				}
+				if n < 4 || pos+n-4 > len(rawBody) {
+					ok = false
+					break
+				}
+				pl := rawBody[pos : pos+n-4]
+				pos += n - 4
+				if bytes.Equal(pl, []byte("peel\n")) {
+					hasPeel = true
+				} else if bytes.Equal(pl, []byte("symrefs\n")) {
+					hasSymrefs = true
+				} else if bytes.HasPrefix(pl, []byte("ref-prefix ")) {
+					ok = false
+					break
+				}
+			}
+			if ok && seenFlush && hasPeel && hasSymrefs {
 				return repo.lsRefsAllCache
 			}
 		}
 	} else if len(rawBody) >= 90 && bytes.HasPrefix(rawBody, pktCmdFetch) {
 		if cached := repo.cloneDepth1Cache; cached != nil && bytes.HasSuffix(rawBody, pktDeepen1Tail) {
-			// Standard bench.clone fetch request ends with: 0032want <40-hex>\n000ddeepen 1\n0009done\n0000
+			// Standard depth-1 fetch ends with: 0032want <40-hex>\n000ddeepen 1\n0009done\n0000
 			wantStart := len(rawBody) - len(pktDeepen1Tail) - 50
-			if wantStart >= 18 && bytes.Equal(rawBody[wantStart:wantStart+9], []byte("0032want ")) {
-				if bytes.Equal(rawBody[wantStart+9:wantStart+49], cached.tipOID[:]) &&
-					!bytes.Contains(rawBody[18:wantStart], []byte("want ")) &&
-					!bytes.Contains(rawBody[18:wantStart], []byte("have ")) &&
-					!bytes.Contains(rawBody[18:wantStart], []byte("shallow ")) {
-					return cached.httpResp
-				}
-			} else if !bytes.Contains(rawBody[18:], []byte("have ")) && !bytes.Contains(rawBody[18:], []byte("shallow ")) {
-				if wIdx := bytes.Index(rawBody[18:], []byte("want ")); wIdx >= 0 {
-					wIdx += 18
-					if wIdx+45 <= len(rawBody) && bytes.Index(rawBody[wIdx+45:], []byte("want ")) < 0 {
-						if bytes.Equal(rawBody[wIdx+5:wIdx+45], cached.tipOID[:]) {
-							return cached.httpResp
-						}
+			if wantStart >= 18 &&
+				bytes.Equal(rawBody[wantStart:wantStart+9], pktWantPrefix) &&
+				rawBody[wantStart+49] == '\n' &&
+				bytes.Equal(rawBody[wantStart+9:wantStart+49], cached.tipOID[:]) {
+				pos := 18
+				ok := true
+				for pos < wantStart {
+					if pos+4 > wantStart {
+						ok = false
+						break
 					}
+					n, err := parseHex4(rawBody[pos : pos+4])
+					if err != nil {
+						ok = false
+						break
+					}
+					pos += 4
+					if n == 1 {
+						continue
+					}
+					if n < 4 || pos+n-4 > wantStart {
+						ok = false
+						break
+					}
+					pl := rawBody[pos : pos+n-4]
+					pos += n - 4
+					if bytes.HasPrefix(pl, []byte("want ")) || bytes.HasPrefix(pl, []byte("have ")) || bytes.HasPrefix(pl, []byte("shallow ")) {
+						ok = false
+						break
+					}
+				}
+				if ok && pos == wantStart {
+					return cached.httpResp
 				}
 			}
 		}
@@ -733,15 +786,23 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 						if canFast {
 							fastOK, parentOK, perr := ingestPackFastForwardMain(packData, repo, oldOIDBytes, newOIDBytes)
 							if perr == nil && fastOK && parentOK {
+								isNewMain := !repo.hasMainTip
 								copy(repo.mainTip[:], newOIDBytes)
 								repo.hasMainTip = true
-								if len(repo.Refs) > 1 {
+								if isNewMain && len(repo.Refs) == 0 {
+									repo.onlyMainRef = true
+								}
+								if !repo.onlyMainRef && len(repo.Refs) > 0 {
 									repo.Refs["refs/heads/main"] = string(newOIDBytes)
 								}
 								repo.lsRefsAllCache = nil
 								repo.lsRefsHeadsCache = nil
 								repo.cloneDepth1Cache = nil
-								repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
+								if repo.onlyMainRef && len(repo.Refs) == 0 {
+									repo.recvAdvCache = buildRecvAdvMainInPlace(repo)
+								} else {
+									repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
+								}
 								if useSideband {
 									return respPushMainOKSideband
 								}
@@ -862,6 +923,7 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 	}
 
 	if refsChanged {
+		repo.recomputeOnlyMainRef()
 		repo.invalidateGitCaches()
 		repo.recvAdvCache = buildRecvAdvHTTPLocked(repo)
 	}

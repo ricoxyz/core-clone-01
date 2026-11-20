@@ -91,8 +91,9 @@ type StoredRepo struct {
 	LabelSeq int
 
 	// Fast 40-byte tip cache for single-ref refs/heads/main push path
-	mainTip    [40]byte
-	hasMainTip bool
+	mainTip     [40]byte
+	hasMainTip  bool
+	onlyMainRef bool
 
 	// Slice-backed O(1) issue store (index = number-1)
 	Issues    []*StoredIssue
@@ -162,6 +163,24 @@ func (r *StoredRepo) syncMainRefString() {
 			r.Refs["refs/heads/main"] = string(r.mainTip[:])
 		}
 	}
+}
+
+func (r *StoredRepo) recomputeOnlyMainRef() {
+	if !r.hasMainTip {
+		r.onlyMainRef = false
+		return
+	}
+	if len(r.Refs) == 0 {
+		r.onlyMainRef = true
+		return
+	}
+	if len(r.Refs) == 1 {
+		if _, ok := r.Refs["refs/heads/main"]; ok {
+			r.onlyMainRef = true
+			return
+		}
+	}
+	r.onlyMainRef = false
 }
 
 func (r *StoredRepo) allocArenaLocked(n int) []byte {
@@ -465,14 +484,7 @@ func buildHTTPGitFrame(contentType string, body []byte) []byte {
 }
 
 func (r *StoredRepo) buildIssueGetHTTPLocked(iss *StoredIssue) []byte {
-	var body []byte
-	if len(iss.Labels) == 0 && strings.HasSuffix(iss.Title, " (bench setup)") {
-		body = append(make([]byte, 0, 32), `{"number":`...)
-		body = strconv.AppendInt(body, int64(iss.Number), 10)
-		body = append(body, '}')
-	} else {
-		body = appendIssueJSON(make([]byte, 0, 256+len(iss.Title)+len(iss.Body)), r.Owner, iss)
-	}
+	body := appendIssueJSON(make([]byte, 0, 256+len(iss.Title)+len(iss.Body)), r.Owner, iss)
 	frame := buildHTTPJSONFrame("200 OK", body, "")
 	iss.cachedGetHTTP = frame
 	return frame
@@ -504,18 +516,7 @@ func (r *StoredRepo) CreateIssueInto(title, body string, labels []string, wbuf [
 	r.Issues = append(r.Issues, iss)
 	r.lastIssue = iss
 
-	// Format JSON directly into stack/scratch buffer then wrap into wbuf
-	if len(labels) == 0 && strings.HasSuffix(title, "]") && strings.Contains(title, " [bench ") {
-		var stack [128]byte
-		jbuf := append(stack[:0], `{"number":`...)
-		jbuf = strconv.AppendInt(jbuf, int64(iss.Number), 10)
-		jbuf = append(jbuf, '}')
-		wbuf = append(wbuf, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
-		wbuf = strconv.AppendInt(wbuf, int64(len(jbuf)), 10)
-		wbuf = append(wbuf, "\r\n\r\n"...)
-		wbuf = append(wbuf, jbuf...)
-		return wbuf, nil
-	}
+	// Format JSON directly into stack buffer then wrap into wbuf
 	var stack [1024]byte
 	jbuf := appendIssueJSON(stack[:0], r.Owner, iss)
 	wbuf = append(wbuf, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
@@ -862,6 +863,7 @@ func (r *StoredRepo) PutFile(branchName, filePath string, content []byte, messag
 		copy(r.mainTip[:], commitSHA)
 		r.hasMainTip = true
 	}
+	r.recomputeOnlyMainRef()
 	r.invalidateGitCaches()
 	return commitSHA, blobSHA, exists, nil
 }
@@ -894,6 +896,7 @@ func (r *StoredRepo) DeleteFile(branchName, filePath, message, author string, ex
 		copy(r.mainTip[:], commitSHA)
 		r.hasMainTip = true
 	}
+	r.recomputeOnlyMainRef()
 	r.invalidateGitCaches()
 	return commitSHA, nil
 }
@@ -1020,6 +1023,7 @@ func (r *StoredRepo) MergePull(num int, checkConflict bool) (string, error) {
 		copy(r.mainTip[:], mergeSHA)
 		r.hasMainTip = true
 	}
+	r.recomputeOnlyMainRef()
 	r.invalidateGitCaches()
 
 	now := fastNowISO()

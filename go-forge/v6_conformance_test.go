@@ -1038,6 +1038,75 @@ func TestV6RestPullRequestListingAndMcpConcurrentToolCalls(t *testing.T) {
 	}
 }
 
+func TestV6GitOfsDeltaPackUnpackAndObjectMaterialization(t *testing.T) {
+	store := NewForgeStore()
+	repo := store.CreateRepo("adaiversen", "ofs-delta-v6", "v6 ofs-delta pack test", false)
+
+	baseText := []byte("v6-ofs-delta-base-content-block-0123456789abcdef\n")
+	wantDerived := []byte("v6-ofs-delta-base-content-block-0123456789abcdef+ofs-v6-delta\n")
+	wantDerivedSha := hashObject(ObjBlob, wantDerived)
+
+	// Encode a valid 2-object pack: object 0 is ObjBlob(baseText), object 1 is ObjOfsDelta referencing object 0
+	var pack bytes.Buffer
+	pack.WriteString("PACK")
+	var hdr [8]byte
+	binary.BigEndian.PutUint32(hdr[0:4], 2)
+	binary.BigEndian.PutUint32(hdr[4:8], 2)
+	pack.Write(hdr[:])
+
+	// Entry 0 at offset 12: ObjBlob (type 3), size = 49 (0x31 -> 2-byte varint: 0x80|0x30|0x01, 0x03)
+	obj0Off := pack.Len()
+	s0 := len(baseText)
+	b0First := byte((uint8(ObjBlob)&7)<<4) | byte(s0&0x0f) | 0x80
+	b0Second := byte(s0 >> 4)
+	pack.WriteByte(b0First)
+	pack.WriteByte(b0Second)
+	pack.Write(compressZlib(baseText))
+
+	// Build delta instructions: srcSize=49, dstSize=62, copy(off=0,size=48), insert(14 bytes "+ofs-v6-delta\n")
+	var deltaBytes []byte
+	deltaBytes = append(deltaBytes, byte(len(baseText)), byte(len(wantDerived)))
+	deltaBytes = append(deltaBytes, 0x80|0x10, 48)
+	deltaBytes = append(deltaBytes, 14)
+	deltaBytes = append(deltaBytes, "+ofs-v6-delta\n"...)
+
+	// Entry 1 at obj1Off: ObjOfsDelta (type 6), size = len(deltaBytes)
+	obj1Off := pack.Len()
+	s1 := len(deltaBytes)
+	b1First := byte((uint8(ObjOfsDelta)&7)<<4) | byte(s1&0x0f)
+	if s1 >= 16 {
+		b1First |= 0x80
+		pack.WriteByte(b1First)
+		pack.WriteByte(byte(s1 >> 4))
+	} else {
+		pack.WriteByte(b1First)
+	}
+	// Negative offset varint: neg = obj1Off - obj0Off (< 127 so 1 byte)
+	neg := obj1Off - obj0Off
+	pack.WriteByte(byte(neg & 0x7f))
+	pack.Write(compressZlib(deltaBytes))
+
+	rawPack := pack.Bytes()
+	sum := hashPackTrailerTest(rawPack)
+	rawPack = append(rawPack, sum...)
+
+	if err := readPackIntoRepo(rawPack, repo); err != nil {
+		t.Fatalf("v6 ObjOfsDelta pack unpack failed: %v", err)
+	}
+	gotObj, exists := repo.Objects[wantDerivedSha]
+	if !exists || string(gotObj.Bytes()) != string(wantDerived) {
+		t.Fatalf("v6 ObjOfsDelta resolved object mismatch")
+	}
+}
+
+func hashPackTrailerTest(body []byte) []byte {
+	reactorSha1.Reset()
+	reactorSha1.Write(body)
+	var out [20]byte
+	return reactorSha1.Sum(out[:0])
+}
+
+
 
 
 

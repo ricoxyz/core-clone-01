@@ -819,7 +819,7 @@ func TestV6GitProtocolV0UploadPackAndRefDeltaResolution(t *testing.T) {
 	nonSbPush = append(nonSbPush, pack1...)
 
 	nonSbResp := handleGitReceivePackRepo(repo, nonSbPush, nil)
-	if !bytes.Contains(nonSbResp, []byte("000eunpack ok\n0018ok refs/heads/main\n0000")) {
+	if !bytes.Contains(nonSbResp, []byte("000eunpack ok\n0017ok refs/heads/main\n0000")) {
 		t.Fatalf("v6 non-sideband push response mismatch: %s", string(nonSbResp))
 	}
 }

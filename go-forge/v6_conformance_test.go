@@ -763,5 +763,159 @@ func TestV6GraphQLBatchNodeAndPullRequestLifecycle(t *testing.T) {
 	}
 }
 
+func TestV6GitProtocolV0UploadPackAndRefDeltaResolution(t *testing.T) {
+	store := NewForgeStore()
+	repo := store.CreateRepo("adaiversen", "v0-refdelta-v6", "v6 v0 upload-pack & ref-delta", false)
+
+	// 1. Seed base blob and tree
+	b0 := []byte("v6-base-payload-for-ref-delta-verification-line-01\n")
+	b0Sha := hashObject(ObjBlob, b0)
+	t0 := buildTree([]TreeEntry{{Mode: "100644", Name: "delta.txt", OID: b0Sha}})
+	t0Sha := hashObject(ObjTree, t0)
+	c0 := buildCommit(t0Sha, nil, "v6 v0 root commit\n", "V6 Tester <v6@make.fun>", 1700050000)
+	c0Sha := hashObject(ObjCommit, c0)
+
+	initPack := writePack([]*GitObject{
+		{Type: ObjBlob, Size: len(b0), Data: b0},
+		{Type: ObjTree, Size: len(t0), Data: t0},
+		{Type: ObjCommit, Size: len(c0), Data: c0},
+	})
+	if rerr := readPackIntoRepo(initPack, repo); rerr != nil {
+		t.Fatalf("v6 initial pack unpack failed: %v", rerr)
+	}
+	repo.Refs["refs/heads/main"] = c0Sha
+	copy(repo.mainTip[:], c0Sha)
+	repo.hasMainTip = true
+
+	// 2. Test Protocol v0 fetch (no command=fetch header, two flush sections: wants +done)
+	var v0FetchReq []byte
+	v0FetchReq = appendPktLineStr(v0FetchReq, "want "+c0Sha+" multi_ack side-band-64k ofs-delta shallow\n")
+	v0FetchReq = appendPktLineStr(v0FetchReq, "deepen 1\n")
+	v0FetchReq = appendPktFlush(v0FetchReq)
+	v0FetchReq = appendPktLineStr(v0FetchReq, "done\n")
+	v0FetchReq = appendPktFlush(v0FetchReq)
+
+	v0FetchResp := handleGitUploadPackRepo(repo, v0FetchReq)
+	if !bytes.Contains(v0FetchResp, []byte("NAK\n")) || !bytes.Contains(v0FetchResp, []byte("PACK")) {
+		t.Fatalf("v6 protocol v0 fetch response missing NAK or PACK")
+	}
+
+	// 3. Test non-sideband receive-pack report-status framing
+	b1 := []byte("v6-updated-payload-without-sideband-capability\n")
+	b1Sha := hashObject(ObjBlob, b1)
+	t1 := buildTree([]TreeEntry{{Mode: "100644", Name: "delta.txt", OID: b1Sha}})
+	t1Sha := hashObject(ObjTree, t1)
+	c1 := buildCommit(t1Sha, []string{c0Sha}, "v6 non-sideband commit\n", "V6 Tester <v6@make.fun>", 1700050010)
+	c1Sha := hashObject(ObjCommit, c1)
+
+	pack1 := writePack([]*GitObject{
+		{Type: ObjBlob, Size: len(b1), Data: b1},
+		{Type: ObjTree, Size: len(t1), Data: t1},
+		{Type: ObjCommit, Size: len(c1), Data: c1},
+	})
+	var nonSbPush []byte
+	nonSbPush = appendPktLineStr(nonSbPush, c0Sha+" "+c1Sha+" refs/heads/main\x00report-status ofs-delta\n")
+	nonSbPush = appendPktFlush(nonSbPush)
+	nonSbPush = append(nonSbPush, pack1...)
+
+	nonSbResp := handleGitReceivePackRepo(repo, nonSbPush, nil)
+	if !bytes.Contains(nonSbResp, []byte("000eunpack ok\n0018ok refs/heads/main\n0000")) {
+		t.Fatalf("v6 non-sideband push response mismatch: %s", string(nonSbResp))
+	}
+}
+
+func TestV6RestNestedDirectoriesDeleteAndIssueSorting(t *testing.T) {
+	store := NewForgeStore()
+	srv := NewServer(store)
+	conn := newConnState()
+
+	repo := store.CreateRepo("adaiversen", "nested-dir-v6", "v6 nested tree & issue sort", true)
+
+	// 1. Create deeply nested files across 3 directory levels
+	_, _, _, err1 := repo.PutFile("main", "a/b/c/deep1.txt", []byte("deep-v6-1"), "commit deep1", "adaiversen", nil)
+	_, sha2, _, err2 := repo.PutFile("main", "a/b/c/deep2.txt", []byte("deep-v6-2"), "commit deep2", "adaiversen", nil)
+	_, _, _, err3 := repo.PutFile("main", "a/b/sibling.txt", []byte("sibling-v6"), "commit sibling", "adaiversen", nil)
+	if err1 != nil || err2 != nil || err3 != nil {
+		t.Fatalf("v6 nested PutFile failed: %v %v %v", err1, err2, err3)
+	}
+
+	// 2. Verify directory listing at root "", "a", "a/b", and "a/b/c"
+	isF0, _, _, entriesRoot, ok0 := repo.GetFileOrDir("main", "")
+	if !ok0 || isF0 || len(entriesRoot) != 1 || entriesRoot[0].Name != "a" || entriesRoot[0].Type != "dir" {
+		t.Fatalf("v6 root directory listing unexpected: %+v", entriesRoot)
+	}
+	isF1, _, _, entriesAB, ok1 := repo.GetFileOrDir("main", "a/b")
+	if !ok1 || isF1 || len(entriesAB) != 2 {
+		t.Fatalf("v6 a/b directory listing expected 2 entries (c and sibling.txt), got: %+v", entriesAB)
+	}
+	isF2, _, _, entriesABC, ok2 := repo.GetFileOrDir("main", "a/b/c")
+	if !ok2 || isF2 || len(entriesABC) != 2 {
+		t.Fatalf("v6 a/b/c directory listing expected 2 files, got: %+v", entriesABC)
+	}
+
+	// 3. Delete deep2.txt with stale SHA (expect error) then valid SHA (expect success)
+	stale := "ffffffffffffffffffffffffffffffffffffffff"
+	if _, derr := repo.DeleteFile("main", "a/b/c/deep2.txt", "del stale", "adaiversen", &stale); derr == nil {
+		t.Fatalf("v6 DeleteFile should fail on stale SHA")
+	}
+	delCommit, derr := repo.DeleteFile("main", "a/b/c/deep2.txt", "del valid", "adaiversen", &sha2)
+	if derr != nil || len(delCommit) != 40 {
+		t.Fatalf("v6 DeleteFile with valid SHA failed: %v", derr)
+	}
+	_, _, _, entriesAfterDel, okAfter := repo.GetFileOrDir("main", "a/b/c")
+	if !okAfter || len(entriesAfterDel) != 1 || entriesAfterDel[0].Name != "deep1.txt" {
+		t.Fatalf("v6 directory listing after DeleteFile unexpected: %+v", entriesAfterDel)
+	}
+
+	// 4. Test REST DELETE /contents/{path} and GET /issues sorting (asc vs desc) & state filtering
+	_, _, _ = repo.CreateIssue("Issue Alpha v6", "alpha", nil)
+	_, _, _ = repo.CreateIssue("Issue Beta v6", "beta", nil)
+	_, _, _ = repo.CreateIssue("Issue Gamma v6", "gamma", nil)
+	closedState := "closed"
+	_, _ = repo.PatchIssue(2, &closedState, nil, nil)
+
+	openAsc := repo.ListIssues("open", "asc")
+	if len(openAsc) != 2 || openAsc[0].Number != 1 || openAsc[1].Number != 3 {
+		t.Fatalf("v6 ListIssues(open, asc) expected [1, 3], got len=%d", len(openAsc))
+	}
+	openDesc := repo.ListIssues("open", "desc")
+	if len(openDesc) != 2 || openDesc[0].Number != 3 || openDesc[1].Number != 1 {
+		t.Fatalf("v6 ListIssues(open, desc) expected [3, 1], got len=%d", len(openDesc))
+	}
+	allDesc := repo.ListIssues("all", "desc")
+	if len(allDesc) != 3 || allDesc[0].Number != 3 || allDesc[1].Number != 2 || allDesc[2].Number != 1 {
+		t.Fatalf("v6 ListIssues(all, desc) expected [3, 2, 1]")
+	}
+
+	// 5. Verify HTTP Connection: close flag and unknown route 404 JSON format
+	closeReq := "GET /api/v3/unknown-v6-endpoint HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-tok\r\nConnection: close\r\n\r\n"
+	conn.prepareReadWindow()
+	copy(conn.buf[conn.end:], closeReq)
+	conn.end += len(closeReq)
+	resp, needMore, _, closeAfter, fatal := srv.stepConn(conn, nil)
+	if fatal || needMore || !closeAfter || !bytes.Contains(resp, []byte("404 Not Found")) {
+		t.Fatalf("v6 Connection: close or 404 handling failed: closeAfter=%v resp=%s", closeAfter, string(resp))
+	}
+}
+
+func TestV6EnvUrlParsingAndRetryBackoffSchedule(t *testing.T) {
+	hp1, hh1, bp1 := parseEnvBase("http://store:8080/env/v1/")
+	if hp1 != "store:8080" || hh1 != "store:8080" || bp1 != "/env/v1" {
+		t.Fatalf("v6 parseEnvBase with port & path failed: %s %s %s", hp1, hh1, bp1)
+	}
+	hp2, hh2, bp2 := parseEnvBase("http://env-host")
+	if hp2 != "env-host:80" || hh2 != "env-host" || bp2 != "" {
+		t.Fatalf("v6 parseEnvBase default port 80 failed: %s %s %s", hp2, hh2, bp2)
+	}
+
+	if d0 := retryDelay(0); d0.Milliseconds() != 250 {
+		t.Fatalf("v6 retryDelay(0) expected 250ms, got %v", d0)
+	}
+	if d9 := retryDelay(9); d9.Milliseconds() != 2000 {
+		t.Fatalf("v6 retryDelay(9) expected cap at 2000ms, got %v", d9)
+	}
+}
+
+
 
 

@@ -745,6 +745,15 @@ func handleGitReceivePackRepo(repo *StoredRepo, rawBody, wbuf []byte) []byte {
 								if useSideband {
 									return respPushMainOKSideband
 								}
+								var rStack [128]byte
+								rb := appendPktLineStr(rStack[:0], "unpack ok\n")
+								rb = appendPktLineStr(rb, "ok refs/heads/main\n")
+								rb = appendPktFlush(rb)
+								wbuf = append(wbuf, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nX-GitHub-Request-Id: gf-1\r\nCache-Control: no-cache\r\nContent-Length: "...)
+								wbuf = strconv.AppendInt(wbuf, int64(len(rb)), 10)
+								wbuf = append(wbuf, "\r\n\r\n"...)
+								wbuf = append(wbuf, rb...)
+								return wbuf
 							}
 						}
 					}

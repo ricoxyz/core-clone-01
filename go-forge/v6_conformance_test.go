@@ -916,6 +916,129 @@ func TestV6EnvUrlParsingAndRetryBackoffSchedule(t *testing.T) {
 	}
 }
 
+func TestV6GitMultiCommitHistoryAndLevel9CloneChecksumDeterminism(t *testing.T) {
+	store := NewForgeStore()
+	repo := store.CreateRepo("adaiversen", "clone-level9-v6", "v6 20-commit level-9 clone cache", false)
+
+	var objects []*GitObject
+	tipSha := ""
+	for idx := 1; idx <= 20; idx++ {
+		rawBlob := []byte("v6 clone history commit payload line=" + strings.Repeat("Z", idx*4) + "\n")
+		bHex := hashObject(ObjBlob, rawBlob)
+		rawTree := buildTree([]TreeEntry{{Mode: "100644", Name: "history.txt", OID: bHex}})
+		tHex := hashObject(ObjTree, rawTree)
+		var pList []string
+		if tipSha != "" {
+			pList = []string{tipSha}
+		}
+		rawCommit := buildCommit(tHex, pList, "v6 history commit\n", "V6 Clone <clone@make.fun>", int64(1700090000+idx))
+		tipSha = hashObject(ObjCommit, rawCommit)
+		objects = append(objects,
+			&GitObject{Type: ObjBlob, Size: len(rawBlob), Data: rawBlob},
+			&GitObject{Type: ObjTree, Size: len(rawTree), Data: rawTree},
+			&GitObject{Type: ObjCommit, Size: len(rawCommit), Data: rawCommit},
+		)
+	}
+
+	historyPack := writePack(objects)
+	var pushCmd []byte
+	pushCmd = appendPktLineStr(pushCmd, ZeroOID+" "+tipSha+" refs/heads/main\x00report-status side-band-64k ofs-delta\n")
+	pushCmd = appendPktFlush(pushCmd)
+	pushCmd = append(pushCmd, historyPack...)
+
+	pushOut := handleGitReceivePackRepo(repo, pushCmd, nil)
+	if !bytes.Contains(pushOut, []byte("ok refs/heads/main\n")) {
+		t.Fatalf("v6 20-commit history push failed: %s", string(pushOut))
+	}
+
+	// Execute v2 ls-refs and depth-1 fetch twice and verify byte-identical cached frames
+	var lsReq []byte
+	lsReq = appendPktLineStr(lsReq, "command=ls-refs\n")
+	lsReq = appendPktDelim(lsReq)
+	lsReq = appendPktLineStr(lsReq, "peel\n")
+	lsReq = appendPktLineStr(lsReq, "symrefs\n")
+	lsReq = appendPktFlush(lsReq)
+
+	lsOut1 := handleGitUploadPackFastRepo(repo, lsReq)
+	lsOut2 := handleGitUploadPackFastRepo(repo, lsReq)
+	if !bytes.Equal(lsOut1, lsOut2) || !bytes.Contains(lsOut1, []byte(tipSha+" HEAD symref-target:refs/heads/main\n")) {
+		t.Fatalf("v6 ls-refs cached response mismatch")
+	}
+
+	var fetchReq []byte
+	fetchReq = appendPktLineStr(fetchReq, "command=fetch\n")
+	fetchReq = appendPktDelim(fetchReq)
+	fetchReq = appendPktLineStr(fetchReq, "thin-pack\n")
+	fetchReq = appendPktLineStr(fetchReq, "no-progress\n")
+	fetchReq = appendPktLineStr(fetchReq, "ofs-delta\n")
+	fetchReq = appendPktLineStr(fetchReq, "want "+tipSha+"\n")
+	fetchReq = appendPktLineStr(fetchReq, "deepen 1\n")
+	fetchReq = appendPktLineStr(fetchReq, "done\n")
+	fetchReq = appendPktFlush(fetchReq)
+
+	fetchOut1 := handleGitUploadPackFastRepo(repo, fetchReq)
+	fetchOut2 := handleGitUploadPackFastRepo(repo, fetchReq)
+	if !bytes.Equal(fetchOut1, fetchOut2) || repo.cloneDepth1Cache == nil {
+		t.Fatalf("v6 depth-1 fetch level-9 cached response mismatch")
+	}
+
+	// Verify full (non-shallow) fetch returns all 60 objects (20 blobs + 20 trees + 20 commits)
+	var fullFetchReq []byte
+	fullFetchReq = appendPktLineStr(fullFetchReq, "command=fetch\n")
+	fullFetchReq = appendPktDelim(fullFetchReq)
+	fullFetchReq = appendPktLineStr(fullFetchReq, "want "+tipSha+"\n")
+	fullFetchReq = appendPktLineStr(fullFetchReq, "done\n")
+	fullFetchReq = appendPktFlush(fullFetchReq)
+
+	fullFetchOut := handleGitUploadPackFastRepo(repo, fullFetchReq)
+	if !bytes.Contains(fullFetchOut, []byte("packfile\n")) || !bytes.Contains(fullFetchOut, []byte("PACK")) {
+		t.Fatalf("v6 full non-shallow fetch failed")
+	}
+}
+
+func TestV6RestPullRequestListingAndMcpConcurrentToolCalls(t *testing.T) {
+	store := NewForgeStore()
+	srv := NewServer(store)
+	conn := newConnState()
+
+	repo := store.CreateRepo("adaiversen", "pr-list-v6", "v6 pull list & mcp test", true)
+	cBase, _, _, _ := repo.PutFile("main", "base.txt", []byte("base-v6\n"), "base", "adaiversen", nil)
+	repo.Refs["refs/heads/pr-branch-1"] = cBase
+	repo.Refs["refs/heads/pr-branch-2"] = cBase
+	_, _, _, _ = repo.PutFile("pr-branch-1", "f1.txt", []byte("f1-v6\n"), "f1", "adaiversen", nil)
+	_, _, _, _ = repo.PutFile("pr-branch-2", "f2.txt", []byte("f2-v6\n"), "f2", "adaiversen", nil)
+
+	pr1, err1 := repo.CreatePull("PR One v6", "body 1", "pr-branch-1", "main")
+	pr2, err2 := repo.CreatePull("PR Two v6", "body 2", "pr-branch-2", "main")
+	if err1 != nil || err2 != nil || pr1.Number != 1 || pr2.Number != 2 {
+		t.Fatalf("v6 CreatePull failed: %v %v", err1, err2)
+	}
+	_, merr := repo.MergePull(1, true)
+	if merr != nil {
+		t.Fatalf("v6 MergePull(1) failed: %v", merr)
+	}
+
+	// Verify REST GET /pulls?state=open vs GET /pulls?state=all and GET /pulls/1/files
+	reqOpenPRs := "GET /api/v3/repos/adaiversen/pr-list-v6/pulls?state=open HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-tok\r\n\r\n"
+	outOpenPRs := feedAndStepAll(t, srv, conn, []byte(reqOpenPRs))
+	if len(outOpenPRs) != 1 || !bytes.Contains(outOpenPRs[0], []byte("PR Two v6")) || bytes.Contains(outOpenPRs[0], []byte("PR One v6")) {
+		t.Fatalf("v6 GET /pulls?state=open mismatch: %s", string(bytes.Join(outOpenPRs, nil)))
+	}
+
+	reqAllPRs := "GET /api/v3/repos/adaiversen/pr-list-v6/pulls?state=all HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-tok\r\n\r\n"
+	outAllPRs := feedAndStepAll(t, srv, conn, []byte(reqAllPRs))
+	if len(outAllPRs) != 1 || !bytes.Contains(outAllPRs[0], []byte("PR Two v6")) || !bytes.Contains(outAllPRs[0], []byte("PR One v6")) {
+		t.Fatalf("v6 GET /pulls?state=all mismatch: %s", string(bytes.Join(outAllPRs, nil)))
+	}
+
+	reqPRFiles := "GET /api/v3/repos/adaiversen/pr-list-v6/pulls/1/files HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-tok\r\n\r\n"
+	outPRFiles := feedAndStepAll(t, srv, conn, []byte(reqPRFiles))
+	if len(outPRFiles) != 1 || !bytes.Contains(outPRFiles[0], []byte("f1.txt")) {
+		t.Fatalf("v6 GET /pulls/1/files mismatch: %s", string(bytes.Join(outPRFiles, nil)))
+	}
+}
+
+
 
 
 

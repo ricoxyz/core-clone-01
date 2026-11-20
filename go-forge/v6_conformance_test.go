@@ -518,4 +518,250 @@ func TestV6GitShallowFetchIncrementalAndDeepenFlow(t *testing.T) {
 	}
 }
 
+func TestV6BenchPush200SequentialFastForwardAndNonFFMixedReport(t *testing.T) {
+	store := NewForgeStore()
+	repo := store.CreateRepo("adaiversen", "bench-push-v6", "v6 sequential push benchmark simulation", false)
+
+	prevTip := ZeroOID
+	for step := 1; step <= 32; step++ {
+		blobPayload := []byte("v6 sequential push benchmark payload step=" + strings.Repeat("X", step) + "\n")
+		bSha := hashObject(ObjBlob, blobPayload)
+		tPayload := buildTree([]TreeEntry{{Mode: "100644", Name: "bench-data.txt", OID: bSha}})
+		tSha := hashObject(ObjTree, tPayload)
+		var parents []string
+		if prevTip != ZeroOID {
+			parents = []string{prevTip}
+		}
+		cPayload := buildCommit(tSha, parents, "v6 bench push\n", "Bench <bench@make.fun>", int64(1700010000+step))
+		cSha := hashObject(ObjCommit, cPayload)
+
+		packBuf := writePack([]*GitObject{
+			{Type: ObjBlob, Size: len(blobPayload), Data: blobPayload},
+			{Type: ObjTree, Size: len(tPayload), Data: tPayload},
+			{Type: ObjCommit, Size: len(cPayload), Data: cPayload},
+		})
+
+		var wireReq []byte
+		wireReq = appendPktLineStr(wireReq, prevTip+" "+cSha+" refs/heads/main\x00report-status side-band-64k ofs-delta\n")
+		wireReq = appendPktFlush(wireReq)
+		wireReq = append(wireReq, packBuf...)
+
+		wireResp := handleGitReceivePackRepo(repo, wireReq, nil)
+		if !bytes.Contains(wireResp, []byte("unpack ok\n")) || !bytes.Contains(wireResp, []byte("ok refs/heads/main\n")) {
+			t.Fatalf("v6 sequential push failed at step %d: %s", step, string(wireResp))
+		}
+		if !repo.hasMainTip || string(repo.mainTip[:]) != cSha {
+			t.Fatalf("v6 mainTip array out of sync at step %d", step)
+		}
+		if !bytes.Contains(repo.recvAdvCache, []byte(cSha+" refs/heads/main\x00")) {
+			t.Fatalf("v6 in-place recvAdvCache did not patch tip %s at step %d", cSha, step)
+		}
+		prevTip = cSha
+	}
+
+	// Verify lazy materialization recovers all 32 commits when REST or clone reads the repository
+	repo.EnsureMaterialized()
+	if repo.hasPendingPacks {
+		t.Fatalf("v6 pendingPacks should be empty after EnsureMaterialized")
+	}
+	if repo.Refs["refs/heads/main"] != prevTip {
+		t.Fatalf("v6 materialized main ref mismatch: got %s want %s", repo.Refs["refs/heads/main"], prevTip)
+	}
+	isF, fileBytes, _, _, okF := repo.GetFileOrDir("main", "bench-data.txt")
+	if !okF || !isF || !bytes.HasPrefix(fileBytes, []byte("v6 sequential push benchmark payload")) {
+		t.Fatalf("v6 materialized file content mismatch")
+	}
+
+	// Test mixed multi-ref push: one valid branch creation + one non-fast-forward update on refs/heads/main
+	divBlob := []byte("divergent v6 root blob\n")
+	divBlobSha := hashObject(ObjBlob, divBlob)
+	divTree := buildTree([]TreeEntry{{Mode: "100644", Name: "div.txt", OID: divBlobSha}})
+	divTreeSha := hashObject(ObjTree, divTree)
+	divCommit := buildCommit(divTreeSha, nil, "divergent root\n", "Bench <bench@make.fun>", 1700020000)
+	divCommitSha := hashObject(ObjCommit, divCommit)
+
+	divPack := writePack([]*GitObject{
+		{Type: ObjBlob, Size: len(divBlob), Data: divBlob},
+		{Type: ObjTree, Size: len(divTree), Data: divTree},
+		{Type: ObjCommit, Size: len(divCommit), Data: divCommit},
+	})
+
+	var mixedReq []byte
+	mixedReq = appendPktLineStr(mixedReq, ZeroOID+" "+divCommitSha+" refs/heads/good-branch\x00report-status side-band-64k ofs-delta\n")
+	mixedReq = appendPktLineStr(mixedReq, prevTip+" "+divCommitSha+" refs/heads/main\n")
+	mixedReq = appendPktFlush(mixedReq)
+	mixedReq = append(mixedReq, divPack...)
+
+	mixedResp := handleGitReceivePackRepo(repo, mixedReq, nil)
+	if !bytes.Contains(mixedResp, []byte("ok refs/heads/good-branch\n")) {
+		t.Fatalf("v6 mixed push should accept good-branch: %s", string(mixedResp))
+	}
+	if !bytes.Contains(mixedResp, []byte("ng refs/heads/main non-fast-forward\n")) {
+		t.Fatalf("v6 mixed push should reject non-fast-forward main: %s", string(mixedResp))
+	}
+	if repo.Refs["refs/heads/main"] != prevTip {
+		t.Fatalf("v6 rejected non-fast-forward moved main ref")
+	}
+}
+
+func TestV6PerFDHotSocketReadAndWriteBenchmarkSimulation(t *testing.T) {
+	store := NewForgeStore()
+	srv := NewServer(store)
+	store.CreateRepo("adaiversen", "bench-rw-v6", "v6 read/write bench", true)
+
+	conn := newConnState()
+	// 1. Run 50 sequential POST /issues on the same connection to exercise lastPostRepo cache & compact 201 path
+	for i := 1; i <= 50; i++ {
+		bodyStr := `{"title":"Issue title [bench ` + string(rune('0'+(i%10))) + `]","body":"v6 benchmark issue body"}`
+		hdrStr := "POST /api/v3/repos/adaiversen/bench-rw-v6/issues HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-secret\r\nContent-Length: 66\r\n\r\n" + bodyStr
+		out := feedAndStepAll(t, srv, conn, []byte(hdrStr))
+		if len(out) != 1 || !bytes.Contains(out[0], []byte("HTTP/1.1 201 Created")) || !bytes.Contains(out[0], []byte(`{"number":`)) {
+			t.Fatalf("v6 sequential POST issue %d failed: %s", i, string(bytes.Join(out, nil)))
+		}
+	}
+	if conn.lastPostRepo == nil || conn.lastPostLen == 0 {
+		t.Fatalf("v6 per-FD lastPostRepo cache was not populated")
+	}
+
+	// 2. Create a bench setup issue and run 100 sequential GET /issues/51 on the same connection
+	setupBody := `{"title":"Setup issue (bench setup)","body":"v6 read setup"}`
+	setupReq := "POST /api/v3/repos/adaiversen/bench-rw-v6/issues HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-secret\r\nContent-Length: 60\r\n\r\n" + setupBody
+	outSetup := feedAndStepAll(t, srv, conn, []byte(setupReq))
+	if len(outSetup) != 1 || !bytes.Contains(outSetup[0], []byte("201 Created")) {
+		t.Fatalf("v6 setup issue create failed")
+	}
+
+	getIssue51 := []byte("GET /api/v3/repos/adaiversen/bench-rw-v6/issues/51 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-secret\r\n\r\n")
+	for i := 1; i <= 100; i++ {
+		outGet := feedAndStepAll(t, srv, conn, getIssue51)
+		if len(outGet) != 1 || !bytes.Contains(outGet[0], []byte(`{"number":51}`)) {
+			t.Fatalf("v6 sequential GET issue 51 iteration %d failed: %s", i, string(bytes.Join(outGet, nil)))
+		}
+	}
+
+	// 3. Delete repository and verify per-FD GET & POST caches invalidate via store.mutationGen
+	store.DeleteRepo("adaiversen", "bench-rw-v6")
+	outAfterDel := feedAndStepAll(t, srv, conn, getIssue51)
+	if len(outAfterDel) != 1 || !bytes.Contains(outAfterDel[0], []byte("404 Not Found")) {
+		t.Fatalf("v6 per-FD GET cache did not invalidate on DeleteRepo: %s", string(bytes.Join(outAfterDel, nil)))
+	}
+}
+
+func TestV6JsonEscapingAndSimpleIssueParserEdgeCases(t *testing.T) {
+	// Verify parseSimpleIssueJSON handles escaped quotes, newlines, tabs, backslashes, and rejects labels key
+	cases := []struct {
+		raw       string
+		wantOK    bool
+		wantTitle string
+		wantBody  string
+	}{
+		{
+			raw:       `{"title":"simple v6 title","body":"simple v6 body"}`,
+			wantOK:    true,
+			wantTitle: "simple v6 title",
+			wantBody:  "simple v6 body",
+		},
+		{
+			raw:       `{ "body" : "line1\nline2\t\"quoted\"\\slash\/end" , "title" : "escaped\r\ntitle" }`,
+			wantOK:    true,
+			wantTitle: "escaped\r\ntitle",
+			wantBody:  "line1\nline2\t\"quoted\"\\slash/end",
+		},
+		{
+			raw:    `{"title":"with labels","body":"fallback","labels":["bug"]}`,
+			wantOK: false,
+		},
+		{
+			raw:    `{"title":"unicode \u0041","body":"fallback"}`,
+			wantOK: false,
+		},
+		{
+			raw:    `not-a-json-object`,
+			wantOK: false,
+		},
+	}
+
+	for idx, tc := range cases {
+		gotTitle, gotBody, ok := parseSimpleIssueJSON([]byte(tc.raw))
+		if ok != tc.wantOK {
+			t.Fatalf("v6 parseSimpleIssueJSON case %d ok=%v want %v", idx, ok, tc.wantOK)
+		}
+		if ok && (gotTitle != tc.wantTitle || gotBody != tc.wantBody) {
+			t.Fatalf("v6 parseSimpleIssueJSON case %d got (%q, %q), want (%q, %q)", idx, gotTitle, gotBody, tc.wantTitle, tc.wantBody)
+		}
+	}
+
+	// Verify appendJSONString escapes control characters and quotes properly
+	escaped := string(appendJSONString(nil, "a\"b\\c\nd\re\tf\x01g"))
+	if escaped != `"a\"b\\c\nd\re\tf\u0001g"` {
+		t.Fatalf("v6 appendJSONString unexpected output: %s", escaped)
+	}
+}
+
+func TestV6GraphQLBatchNodeAndPullRequestLifecycle(t *testing.T) {
+	store := NewForgeStore()
+	srv := NewServer(store)
+	conn := newConnState()
+
+	repo := store.CreateRepo("adaiversen", "gql-pr-v6", "v6 graphql pr lifecycle", false)
+	baseSha, _, _, _ := repo.PutFile("main", "README.md", []byte("# v6\n"), "init readme", "adaiversen", nil)
+	repo.Refs["refs/heads/gql-branch-v6"] = baseSha
+	_, _, _, _ = repo.PutFile("gql-branch-v6", "v6.txt", []byte("v6 feature\n"), "add v6.txt", "adaiversen", nil)
+
+	repoGID := toGlobalID("Repository", "1")
+
+	// 1. Node query by Global ID
+	nodeRes := executeGraphQL(store, GraphQLRequest{
+		Query:     `query($id:ID!){ node(id:$id){ ... on Repository { __typename id name nameWithOwner } } }`,
+		Variables: map[string]any{"id": repoGID},
+	}, "adaiversen")
+	if len(nodeRes.Errors) > 0 || nodeRes.Data == nil {
+		t.Fatalf("v6 GraphQL node query failed: %+v", nodeRes)
+	}
+
+	// 2. createPullRequest mutation
+	createPRRes := executeGraphQL(store, GraphQLRequest{
+		Query: `mutation($input:CreatePullRequestInput!){ createPullRequest(input:$input){ pullRequest { id number state headRefName baseRefName } } }`,
+		Variables: map[string]any{
+			"input": map[string]any{
+				"repositoryId": repoGID,
+				"title":        "GQL v6 Pull Request",
+				"body":         "created over GraphQL v4",
+				"headRefName":  "gql-branch-v6",
+				"baseRefName":  "main",
+			},
+		},
+	}, "adaiversen")
+	if len(createPRRes.Errors) > 0 || len(repo.Pulls) != 1 {
+		t.Fatalf("v6 GraphQL createPullRequest failed: %+v", createPRRes)
+	}
+
+	// 3. Query pullRequest(number:1) with files and pullRequests list
+	prQueryRes := executeGraphQL(store, GraphQLRequest{
+		Query: `query { repository(owner:"adaiversen", name:"gql-pr-v6") { pullRequests(first:10) { nodes { number state } } pullRequest(number:1) { number state mergeable files(first:10) { nodes { path } } } } }`,
+	}, "adaiversen")
+	if len(prQueryRes.Errors) > 0 || prQueryRes.Data == nil {
+		t.Fatalf("v6 GraphQL pullRequest query failed: %+v", prQueryRes)
+	}
+
+	// 4. mergePullRequest mutation
+	prGID := toGlobalID("PullRequest", "adaiversen/gql-pr-v6/1")
+	mergePRRes := executeGraphQL(store, GraphQLRequest{
+		Query:     `mutation($input:MergePullRequestInput!){ mergePullRequest(input:$input){ pullRequest { number merged state } } }`,
+		Variables: map[string]any{"input": map[string]any{"pullRequestId": prGID}},
+	}, "adaiversen")
+	if len(mergePRRes.Errors) > 0 || !repo.Pulls[0].Merged {
+		t.Fatalf("v6 GraphQL mergePullRequest failed: %+v", mergePRRes)
+	}
+
+	// 5. Batched GraphQL HTTP POST via Server.stepConn
+	batchJSON := `[{"query":"query { viewer { login } }"},{"query":"query { repository(owner:\"adaiversen\", name:\"missing-v6\") { id } }"}]`
+	batchReq := "POST /api/graphql HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer v6-tok\r\nContent-Length: 123\r\n\r\n" + batchJSON
+	batchOut := feedAndStepAll(t, srv, conn, []byte(batchReq))
+	if len(batchOut) != 1 || !bytes.Contains(batchOut[0], []byte(`"login":"adaiversen"`)) || !bytes.Contains(batchOut[0], []byte(`"repository":null`)) {
+		t.Fatalf("v6 GraphQL batched HTTP POST failed: %s", string(bytes.Join(batchOut, nil)))
+	}
+}
+
+
 

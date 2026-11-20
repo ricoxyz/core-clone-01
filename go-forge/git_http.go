@@ -128,8 +128,10 @@ func sortedRefsLocked(repo *StoredRepo) []refPair {
 func buildRecvAdvMainInPlace(repo *StoredRepo) []byte {
 	const caps = "report-status delete-refs side-band-64k ofs-delta"
 	if repo.recvAdvRef == "refs/heads/main" && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
-		copy(repo.recvAdvSingle[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], repo.mainTip[:])
-		return repo.recvAdvSingle
+		frame := repo.allocArenaLocked(len(repo.recvAdvSingle))
+		copy(frame, repo.recvAdvSingle)
+		copy(frame[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], repo.mainTip[:])
+		return frame
 	}
 	body := make([]byte, 0, 160)
 	body = appendPktLineStr(body, "# service=git-receive-pack\n")
@@ -142,7 +144,9 @@ func buildRecvAdvMainInPlace(repo *StoredRepo) []byte {
 	repo.recvAdvSingle = frame
 	repo.recvAdvRef = "refs/heads/main"
 	repo.recvAdvOIDOff = hdrLen + oidBodyOff
-	return frame
+	out := repo.allocArenaLocked(len(frame))
+	copy(out, frame)
+	return out
 }
 
 func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
@@ -160,8 +164,10 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 		for k, v := range repo.Refs {
 			if strings.HasPrefix(k, "refs/") && len(v) == 40 {
 				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
-					copy(repo.recvAdvSingle[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
-					return repo.recvAdvSingle
+					frame := repo.allocArenaLocked(len(repo.recvAdvSingle))
+					copy(frame, repo.recvAdvSingle)
+					copy(frame[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
+					return frame
 				}
 				body := make([]byte, 0, 160)
 				body = appendPktLineStr(body, "# service=git-receive-pack\n")
@@ -174,7 +180,9 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 				repo.recvAdvSingle = frame
 				repo.recvAdvRef = k
 				repo.recvAdvOIDOff = hdrLen + oidBodyOff
-				return frame
+				out := repo.allocArenaLocked(len(frame))
+				copy(out, frame)
+				return out
 			}
 		}
 	}

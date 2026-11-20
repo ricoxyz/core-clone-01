@@ -26,11 +26,12 @@ var (
 func prewarmPools() {}
 
 type Server struct {
-	store      *ForgeStore
-	listener   net.Listener
-	listenFd   int
-	epollFd    int
-	fallbackMu sync.Mutex
+	store     *ForgeStore
+	listener  net.Listener
+	listenFds [2]int
+	epollFds  [2]int
+	storeMu   sync.Mutex
+	closeOnce sync.Once
 }
 
 func NewServer(store *ForgeStore) *Server {

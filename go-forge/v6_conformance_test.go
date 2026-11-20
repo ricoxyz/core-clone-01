@@ -453,7 +453,7 @@ func TestV6McpFullToolSuiteAndErrorContracts(t *testing.T) {
 	}
 
 	stMergePR, bMergePR := handleMcpRPC(store, []byte(`{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"merge_pull_request","arguments":{"owner":"adaiversen","repo":"mcp-v6-flow","pull_number":1}}}`), "adaiversen")
-	if stMergePR != "200 OK" || !bytes.Contains(bMergePR, []byte(`"merged":true`)) {
+	if stMergePR != "200 OK" || !bytes.Contains(bMergePR, []byte("Pull request successfully merged")) {
 		t.Fatalf("v6 MCP merge_pull_request failed: %s", string(bMergePR))
 	}
 

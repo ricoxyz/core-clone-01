@@ -112,7 +112,7 @@ type StoredRepo struct {
 	cloneDepth1Cache *cloneCacheEntry
 
 	// Single-buffer in-place template for zero-alloc single-ref receive-pack advertisement patching
-	recvAdvSingle []byte
+	recvAdvBuf    []byte
 	recvAdvRef    string
 	recvAdvOIDOff int
 

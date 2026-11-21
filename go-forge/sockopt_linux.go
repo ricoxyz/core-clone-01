@@ -12,6 +12,8 @@ import (
 	"unsafe"
 )
 
+const isSingleReactor = true
+
 func tuneRuntimeForContainer() {
 	// Keep 2 Ps so P0 stays exclusively pinned to the LockOSThread RawSyscall reactor
 	// while P1 handles waitForEnvDone and signals without stealing P0.
@@ -149,6 +151,23 @@ func rawSetTCPOpt(fd int, opt int) {
 	_, _, _ = syscall.RawSyscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), uintptr(syscall.IPPROTO_TCP), uintptr(opt), uintptr(unsafe.Pointer(&one)), 4, 0)
 }
 
+func rawSetRecvTimeo(fd int, usec int64) {
+	tv := syscall.Timeval{Sec: 0, Usec: usec}
+	_, _, _ = syscall.RawSyscall6(
+		syscall.SYS_SETSOCKOPT,
+		uintptr(fd),
+		uintptr(syscall.SOL_SOCKET),
+		uintptr(syscall.SO_RCVTIMEO),
+		uintptr(unsafe.Pointer(&tv)),
+		unsafe.Sizeof(tv),
+		0,
+	)
+}
+
+func rawFcntlSetFl(fd int, flags uintptr) {
+	_, _, _ = syscall.RawSyscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(syscall.F_SETFL), flags)
+}
+
 func rawEpollCtl(epfd, op, fd int, ev *syscall.EpollEvent) syscall.Errno {
 	_, _, err := syscall.RawSyscall6(syscall.SYS_EPOLL_CTL, uintptr(epfd), uintptr(op), uintptr(fd), uintptr(unsafe.Pointer(ev)), 0, 0)
 	return err
@@ -213,7 +232,7 @@ func (s *Server) Serve() {
 		}
 	}
 
-	for {
+	for !s.closed.Load() {
 		n, errno := rawEpollPwaitBlock(epollFd, events[:])
 		if errno != 0 {
 			if errno == syscall.EINTR {
@@ -330,6 +349,7 @@ func (s *Server) Serve() {
 								needQuickAckPending = needQuickAck
 								break
 							}
+							c.hotStreak++
 						}
 						if closeConnNow || len(c.outPending) > 0 || !wantMoreRead {
 							break
@@ -355,6 +375,85 @@ func (s *Server) Serve() {
 				if closeConnNow || eof {
 					closeConn(fd, c)
 					continue
+				}
+
+				// Adaptive Hot-Socket 2-Syscall Direct-Read Mode:
+				// When only 1 fd was ready in this epoll batch (n == 1) and this connection sustained
+				// a keep-alive streak >= 3, switch temporarily to blocking read with bounded 3 ms SO_RCVTIMEO.
+				if n == 1 && len(c.outPending) == 0 && c.hotStreak >= 3 && !s.closed.Load() {
+					if !c.rcvTimeoSet {
+						rawSetRecvTimeo(fd, 3000)
+						c.rcvTimeoSet = true
+					}
+					rawFcntlSetFl(fd, 0)
+					hotClose := false
+					hotQuickAck := false
+					for !s.closed.Load() {
+						c.prepareReadWindow()
+						rn, rerr := rawRead(fd, c.buf[c.end:])
+						if rn > 0 {
+							c.end += rn
+							hotQuickAck = false
+							for c.end > c.start && len(c.outPending) == 0 {
+								resp, needMore, needQuickAck, closeAfter, fatal := s.stepConn(c)
+								if fatal {
+									hotClose = true
+									break
+								}
+								if len(resp) > 0 {
+									if !writeOrQueueLinux(epollFd, fd, c, resp, closeAfter) {
+										hotClose = true
+										break
+									}
+									if closeAfter && len(c.outPending) == 0 {
+										hotClose = true
+										break
+									}
+								} else if closeAfter {
+									hotClose = true
+									break
+								}
+								if needMore {
+									if needQuickAck {
+										hotQuickAck = true
+									}
+									break
+								}
+								c.hotStreak++
+							}
+							if hotClose || len(c.outPending) > 0 {
+								break
+							}
+							if hotQuickAck {
+								rawSetTCPOpt(fd, syscall.TCP_QUICKACK)
+							}
+							continue
+						}
+						if rn == 0 && rerr == 0 {
+							hotClose = true
+							break
+						}
+						if rerr == syscall.EINTR {
+							if s.closed.Load() {
+								break
+							}
+							continue
+						}
+						if rerr == syscall.EAGAIN || rerr == syscall.EWOULDBLOCK {
+							if hotQuickAck {
+								rawSetTCPOpt(fd, syscall.TCP_QUICKACK)
+							}
+							break
+						}
+						hotClose = true
+						break
+					}
+					if hotClose {
+						closeConn(fd, c)
+						continue
+					}
+					rawFcntlSetFl(fd, syscall.O_NONBLOCK)
+					c.hotStreak = 0
 				}
 			}
 		}
@@ -440,6 +539,7 @@ func (s *Server) cleanupFds() {
 
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		if s.wakeFd > 0 {
 			var one uint64 = 1
 			_, _, _ = syscall.RawSyscall(syscall.SYS_WRITE, uintptr(s.wakeFd), uintptr(unsafe.Pointer(&one)), 8)

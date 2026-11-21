@@ -125,13 +125,21 @@ func sortedRefsLocked(repo *StoredRepo) []refPair {
 	return refs
 }
 
+func patchRecvAdvBuf(repo *StoredRepo, oid []byte) []byte {
+	if isSingleReactor {
+		copy(repo.recvAdvBuf[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], oid)
+		return repo.recvAdvBuf
+	}
+	frame := repo.allocArenaLocked(len(repo.recvAdvBuf))
+	copy(frame, repo.recvAdvBuf)
+	copy(frame[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], oid)
+	return frame
+}
+
 func buildRecvAdvMainInPlace(repo *StoredRepo) []byte {
 	const caps = "report-status delete-refs side-band-64k ofs-delta"
-	if repo.recvAdvRef == "refs/heads/main" && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
-		frame := repo.allocArenaLocked(len(repo.recvAdvSingle))
-		copy(frame, repo.recvAdvSingle)
-		copy(frame[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], repo.mainTip[:])
-		return frame
+	if repo.recvAdvRef == "refs/heads/main" && repo.recvAdvOIDOff > 0 && len(repo.recvAdvBuf) > 0 {
+		return patchRecvAdvBuf(repo, repo.mainTip[:])
 	}
 	body := make([]byte, 0, 160)
 	body = appendPktLineStr(body, "# service=git-receive-pack\n")
@@ -141,9 +149,12 @@ func buildRecvAdvMainInPlace(repo *StoredRepo) []byte {
 	body = appendPktFlush(body)
 	frame := buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
 	hdrLen := len(frame) - len(body)
-	repo.recvAdvSingle = frame
+	repo.recvAdvBuf = frame
 	repo.recvAdvRef = "refs/heads/main"
 	repo.recvAdvOIDOff = hdrLen + oidBodyOff
+	if isSingleReactor {
+		return frame
+	}
 	out := repo.allocArenaLocked(len(frame))
 	copy(out, frame)
 	return out
@@ -163,11 +174,8 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 	if len(repo.Refs) == 1 {
 		for k, v := range repo.Refs {
 			if strings.HasPrefix(k, "refs/") && len(v) == 40 {
-				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvSingle) > 0 {
-					frame := repo.allocArenaLocked(len(repo.recvAdvSingle))
-					copy(frame, repo.recvAdvSingle)
-					copy(frame[repo.recvAdvOIDOff:repo.recvAdvOIDOff+40], v)
-					return frame
+				if repo.recvAdvRef == k && repo.recvAdvOIDOff > 0 && len(repo.recvAdvBuf) > 0 {
+					return patchRecvAdvBuf(repo, []byte(v))
 				}
 				body := make([]byte, 0, 160)
 				body = appendPktLineStr(body, "# service=git-receive-pack\n")
@@ -177,9 +185,12 @@ func buildRecvAdvHTTPLocked(repo *StoredRepo) []byte {
 				body = appendPktFlush(body)
 				frame := buildHTTPGitFrame("application/x-git-receive-pack-advertisement", body)
 				hdrLen := len(frame) - len(body)
-				repo.recvAdvSingle = frame
+				repo.recvAdvBuf = frame
 				repo.recvAdvRef = k
 				repo.recvAdvOIDOff = hdrLen + oidBodyOff
+				if isSingleReactor {
+					return frame
+				}
 				out := repo.allocArenaLocked(len(frame))
 				copy(out, frame)
 				return out

@@ -7,6 +7,8 @@ import (
 	"net"
 )
 
+const isSingleReactor = false
+
 func tuneRuntimeForContainer() {}
 
 func (s *Server) Listen(addr string) (int, error) {

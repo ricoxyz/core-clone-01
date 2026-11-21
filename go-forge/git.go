@@ -795,10 +795,45 @@ func ingestPackFastForwardMain(pack []byte, repo *StoredRepo, oldOID40, newOID40
 		return true, true, nil
 	}
 
-	// Scan the tail 1 KiB of the pack body first (where commits typically reside),
-	// falling back to the remaining prefix if not found in the tail.
 	var scratch [2048]byte
 	var calcHex [40]byte
+	tryCommitAt := func(zOff, size int) (fastOK, parentMatched, decided bool) {
+		if size <= 0 || size > 65536 || zOff+3 > len(body) {
+			return false, false, false
+		}
+		if body[zOff] != 0x78 {
+			return false, false, false
+		}
+		b1 := body[zOff+1]
+		if b1 != 0x9c && b1 != 0x01 && b1 != 0x5e && b1 != 0xda {
+			return false, false, false
+		}
+		var dst []byte
+		if size <= len(scratch) {
+			dst = scratch[:size]
+		}
+		raw, derr := decompressRawFlateInto(body[zOff:], size, dst)
+		if derr != nil || len(raw) != size {
+			return false, false, false
+		}
+		hashCommitBytes(raw, &calcHex)
+		if bytes.Equal(calcHex[:], newOID40) {
+			fp := fastFirstParentBytes(raw)
+			if len(fp) == 40 && bytes.Equal(fp, oldOID40) {
+				packCopy := repo.allocArenaLocked(len(pack))
+				copy(packCopy, pack)
+				repo.pendingPacks = append(repo.pendingPacks, packCopy)
+				repo.hasPendingPacks = true
+				return true, true, true
+			}
+			// Found the new commit, but its first parent is not oldOID40 (could be multi-step or non-FF)
+			return false, false, true
+		}
+		return false, false, false
+	}
+
+	// Scan the tail 1 KiB of the pack body first (push packs place [blob, tree, commit] near the tail),
+	// falling back to the remaining prefix if not found in the tail.
 	scanRange := func(hi, lo int) (fastOK, parentMatched, decided bool) {
 		for i := hi; i >= lo; i-- {
 			if body[i] != 0x78 {
@@ -830,26 +865,8 @@ func ingestPackFastForwardMain(pack []byte, repo *StoredRepo, oldOID40, newOID40
 			if size < 0 {
 				continue
 			}
-			var dst []byte
-			if size <= len(scratch) {
-				dst = scratch[:size]
-			}
-			raw, derr := decompressRawFlateInto(body[i:], size, dst)
-			if derr != nil || len(raw) != size {
-				continue
-			}
-			hashCommitBytes(raw, &calcHex)
-			if bytes.Equal(calcHex[:], newOID40) {
-				fp := fastFirstParentBytes(raw)
-				if len(fp) == 40 && bytes.Equal(fp, oldOID40) {
-					packCopy := repo.allocArenaLocked(len(pack))
-					copy(packCopy, pack)
-					repo.pendingPacks = append(repo.pendingPacks, packCopy)
-					repo.hasPendingPacks = true
-					return true, true, true
-				}
-				// Found the new commit, but its first parent is not oldOID40 (could be multi-step or non-FF)
-				return false, false, true
+			if fastOK, parentMatched, decided := tryCommitAt(i, size); decided {
+				return fastOK, parentMatched, true
 			}
 		}
 		return false, false, false

@@ -33,6 +33,7 @@ type Server struct {
 	epollFd    int
 	wakeFd     int
 	serving    atomic.Bool
+	closed     atomic.Bool
 	fallbackMu sync.Mutex
 	closeOnce  sync.Once
 }
@@ -50,6 +51,8 @@ type connState struct {
 	outPending      []byte
 	watchingOut     bool
 	closeAfterFlush bool
+	hotStreak       int
+	rcvTimeoSet     bool
 
 	// Per-FD Hot-Socket GET request cache (accelerates 2,000 sequential GETs on one keep-alive socket)
 	lastGetRaw [320]byte
@@ -101,6 +104,8 @@ func (c *connState) resetForPool() {
 	c.outPending = c.outPending[:0]
 	c.watchingOut = false
 	c.closeAfterFlush = false
+	c.hotStreak = 0
+	c.rcvTimeoSet = false
 	c.lastGetLen = 0
 	c.lastGetResp = nil
 	c.lastGetRepo = nil

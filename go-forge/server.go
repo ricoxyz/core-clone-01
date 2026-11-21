@@ -51,8 +51,6 @@ type connState struct {
 	outPending      []byte
 	watchingOut     bool
 	closeAfterFlush bool
-	hotStreak       int
-	rcvTimeoSet     bool
 
 	// Per-FD Hot-Socket GET request cache (accelerates 2,000 sequential GETs on one keep-alive socket)
 	lastGetRaw [320]byte
@@ -84,7 +82,7 @@ type connState struct {
 
 func newConnState() *connState {
 	return &connState{
-		buf:  make([]byte, 4096),
+		buf:  make([]byte, 8192),
 		wbuf: make([]byte, 0, 2048),
 	}
 }
@@ -94,7 +92,7 @@ func (c *connState) resetForPool() {
 	c.start = 0
 	c.end = 0
 	if len(c.buf) > 65536 {
-		c.buf = make([]byte, 4096)
+		c.buf = make([]byte, 8192)
 	}
 	if cap(c.wbuf) > 65536 {
 		c.wbuf = make([]byte, 0, 2048)
@@ -104,8 +102,6 @@ func (c *connState) resetForPool() {
 	c.outPending = c.outPending[:0]
 	c.watchingOut = false
 	c.closeAfterFlush = false
-	c.hotStreak = 0
-	c.rcvTimeoSet = false
 	c.lastGetLen = 0
 	c.lastGetResp = nil
 	c.lastGetRepo = nil

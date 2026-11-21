@@ -230,19 +230,20 @@ func handleGitUploadPackBytes(store *ForgeStore, owner, repoName, rawBody []byte
 }
 
 var (
-	pktCmdLsRefs   = []byte("0014command=ls-refs\n")
-	pktCmdFetch    = []byte("0012command=fetch\n")
-	pktDeepen1Tail = []byte("000ddeepen 1\n0009done\n0000")
-	pktWantPrefix  = []byte("0032want ")
+	pktCmdLsRefs = []byte("0014command=ls-refs\n")
+	pktCmdFetch  = []byte("0012command=fetch\n")
 )
 
 func handleGitUploadPackFastRepo(repo *StoredRepo, rawBody []byte) []byte {
-	// Zero-scan fixed-offset / single-pass pkt-line fast path for Protocol v2 ls-refs and depth-1 clone fetch
+	// Zero-alloc single-pass pkt-line fast path for Protocol v2 ls-refs and depth-1 clone fetch
 	if len(rawBody) >= 24 && bytes.HasPrefix(rawBody, pktCmdLsRefs) {
-		if len(repo.lsRefsAllCache) > 0 {
+		if len(repo.lsRefsAllCache) > 0 || len(repo.lsRefsHeadsCache) > 0 {
 			pos := 20
 			hasPeel := false
 			hasSymrefs := false
+			hasHeadPrefix := false
+			hasHeadsPrefix := false
+			prefixCount := 0
 			ok := true
 			seenFlush := false
 			for pos+4 <= len(rawBody) {
@@ -269,53 +270,79 @@ func handleGitUploadPackFastRepo(repo *StoredRepo, rawBody []byte) []byte {
 					hasPeel = true
 				} else if bytes.Equal(pl, []byte("symrefs\n")) {
 					hasSymrefs = true
-				} else if bytes.HasPrefix(pl, []byte("ref-prefix ")) {
+				} else if bytes.Equal(pl, []byte("ref-prefix HEAD\n")) {
+					hasHeadPrefix = true
+					prefixCount++
+				} else if bytes.Equal(pl, []byte("ref-prefix refs/heads/\n")) {
+					hasHeadsPrefix = true
+					prefixCount++
+				} else if bytes.HasPrefix(pl, []byte("ref-prefix ")) || bytes.Equal(pl, []byte("unborn\n")) {
 					ok = false
 					break
 				}
 			}
 			if ok && seenFlush && hasPeel && hasSymrefs {
-				return repo.lsRefsAllCache
+				if prefixCount == 0 && len(repo.lsRefsAllCache) > 0 {
+					return repo.lsRefsAllCache
+				}
+				if prefixCount == 2 && hasHeadPrefix && hasHeadsPrefix && len(repo.lsRefsHeadsCache) > 0 {
+					return repo.lsRefsHeadsCache
+				}
 			}
 		}
-	} else if len(rawBody) >= 90 && bytes.HasPrefix(rawBody, pktCmdFetch) {
-		if cached := repo.cloneDepth1Cache; cached != nil && bytes.HasSuffix(rawBody, pktDeepen1Tail) {
-			// Standard depth-1 fetch ends with: 0032want <40-hex>\n000ddeepen 1\n0009done\n0000
-			wantStart := len(rawBody) - len(pktDeepen1Tail) - 50
-			if wantStart >= 18 &&
-				bytes.Equal(rawBody[wantStart:wantStart+9], pktWantPrefix) &&
-				rawBody[wantStart+49] == '\n' &&
-				bytes.Equal(rawBody[wantStart+9:wantStart+49], cached.tipOID[:]) {
-				pos := 18
-				ok := true
-				for pos < wantStart {
-					if pos+4 > wantStart {
-						ok = false
-						break
-					}
-					n, err := parseHex4(rawBody[pos : pos+4])
-					if err != nil {
-						ok = false
-						break
-					}
-					pos += 4
-					if n == 1 {
-						continue
-					}
-					if n < 4 || pos+n-4 > wantStart {
-						ok = false
-						break
-					}
-					pl := rawBody[pos : pos+n-4]
-					pos += n - 4
-					if bytes.HasPrefix(pl, []byte("want ")) || bytes.HasPrefix(pl, []byte("have ")) || bytes.HasPrefix(pl, []byte("shallow ")) {
-						ok = false
-						break
-					}
+	} else if len(rawBody) >= 50 && bytes.HasPrefix(rawBody, pktCmdFetch) {
+		if cached := repo.cloneDepth1Cache; cached != nil {
+			// Order-independent single-pass pkt-line scan for depth-1 clone fetch
+			pos := 18
+			wantCount := 0
+			wantMatch := false
+			hasDeepen1 := false
+			hasDone := false
+			ok := true
+			seenFlush := false
+			for pos+4 <= len(rawBody) {
+				n, err := parseHex4(rawBody[pos : pos+4])
+				if err != nil {
+					ok = false
+					break
 				}
-				if ok && pos == wantStart {
-					return cached.httpResp
+				pos += 4
+				if n == 0 {
+					seenFlush = pos == len(rawBody)
+					break
 				}
+				if n == 1 {
+					continue
+				}
+				if n < 4 || pos+n-4 > len(rawBody) {
+					ok = false
+					break
+				}
+				pl := rawBody[pos : pos+n-4]
+				pos += n - 4
+				if bytes.HasPrefix(pl, []byte("want ")) {
+					wantCount++
+					if wantCount == 1 && len(pl) == 46 && pl[45] == '\n' && bytes.Equal(pl[5:45], cached.tipOID[:]) {
+						wantMatch = true
+					} else {
+						ok = false
+						break
+					}
+				} else if bytes.Equal(pl, []byte("deepen 1\n")) {
+					hasDeepen1 = true
+				} else if bytes.Equal(pl, []byte("done\n")) {
+					hasDone = true
+				} else if bytes.HasPrefix(pl, []byte("have ")) ||
+					bytes.HasPrefix(pl, []byte("shallow ")) ||
+					bytes.HasPrefix(pl, []byte("deepen")) ||
+					bytes.HasPrefix(pl, []byte("filter ")) ||
+					bytes.HasPrefix(pl, []byte("want-ref ")) {
+					ok = false
+					break
+				}
+			}
+			if ok && seenFlush && wantCount == 1 && wantMatch && hasDeepen1 && hasDone {
+				return cached.httpResp
 			}
 		}
 	}

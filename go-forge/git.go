@@ -190,19 +190,6 @@ func decompressRawFlateInto(src []byte, expectedSize int, dst []byte) ([]byte, e
 			return nil, err
 		}
 	}
-	var trail [8]byte
-	for {
-		n, err := reactorFlateFr.Read(trail[:])
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		if n > 0 {
-			out = append(out, trail[:n]...)
-		}
-	}
 	return out, nil
 }
 
